@@ -30,18 +30,19 @@ class CatalogDownloadWorker(QObject):
         rich_refresh = self.catalog.get_metadata("rich_schema_version", "0") != RICH_SCHEMA_VERSION
 
         if rich_refresh:
-            # Existing rows need to be revisited once so supertype/subtype fields are populated.
-            page = 1
-            processed = 0
-            self.catalog.set_metadata("rich_refresh_page", "0")
-        else:
-            saved_page = self.catalog.get_metadata("last_completed_page", "0")
             try:
-                last_completed_page = int(saved_page or 0)
+                completed = int(self.catalog.get_metadata("rich_refresh_page", "0") or 0)
             except ValueError:
-                last_completed_page = 0
-            last_completed_page = max(last_completed_page, existing_count // page_size)
-            page = last_completed_page + 1
+                completed = 0
+            page = completed + 1
+            processed = completed * page_size
+        else:
+            try:
+                completed = int(self.catalog.get_metadata("last_completed_page", "0") or 0)
+            except ValueError:
+                completed = 0
+            completed = max(completed, existing_count // page_size)
+            page = completed + 1
             processed = existing_count
 
         try:
@@ -68,10 +69,8 @@ class CatalogDownloadWorker(QObject):
 
                 self.catalog.replace_page(cards)
                 processed = min(total_count, processed + len(cards)) if rich_refresh else self.catalog.card_count()
-                if rich_refresh:
-                    self.catalog.set_metadata("rich_refresh_page", str(page))
-                else:
-                    self.catalog.set_metadata("last_completed_page", str(page))
+                metadata_key = "rich_refresh_page" if rich_refresh else "last_completed_page"
+                self.catalog.set_metadata(metadata_key, str(page))
                 self.progress.emit(processed, total_count, page)
 
                 if processed >= total_count or len(cards) < page_size:
