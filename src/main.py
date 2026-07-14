@@ -67,19 +67,25 @@ class MainWindow(QMainWindow):
         controls.addWidget(search_button)
         layout.addLayout(controls)
 
+        selection_help = QLabel(
+            "Select multiple rows with Ctrl+Click, or select a range with Shift+Click."
+        )
+        selection_help.setStyleSheet("color: #aaaaaa;")
+        layout.addWidget(selection_help)
+
         self.results_table = QTableWidget(0, 5)
         self.results_table.setHorizontalHeaderLabels(
             ["Card", "Set", "Number", "Rarity", "Card ID"]
         )
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.results_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.results_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.results_table.horizontalHeader().setStretchLastSection(True)
-        self.results_table.doubleClicked.connect(self.add_selected_card)
+        self.results_table.doubleClicked.connect(self.add_current_card)
         layout.addWidget(self.results_table)
 
-        add_button = QPushButton("Add Selected Card to Inventory")
-        add_button.clicked.connect(self.add_selected_card)
+        add_button = QPushButton("Add Selected Cards to Inventory")
+        add_button.clicked.connect(self.add_selected_cards)
         layout.addWidget(add_button, alignment=Qt.AlignmentFlag.AlignRight)
         return page
 
@@ -145,18 +151,43 @@ class MainWindow(QMainWindow):
         self.results_table.resizeColumnsToContents()
         self.statusBar().showMessage(f"Found {len(self.search_results)} matching cards")
 
-    def add_selected_card(self) -> None:
+    def add_current_card(self) -> None:
         row = self.results_table.currentRow()
         if row < 0 or row >= len(self.search_results):
             QMessageBox.information(self, "Add card", "Select a card first.")
             return
+        self._add_rows([row])
 
-        card = self.search_results[row]
-        self.database.add_card(card)
-        self.refresh_inventory()
-        self.statusBar().showMessage(
-            f"Added {card['name']} — {card['set_name']} {card['number']}"
+    def add_selected_cards(self) -> None:
+        selected_rows = sorted(
+            {index.row() for index in self.results_table.selectionModel().selectedRows()}
         )
+        if not selected_rows:
+            QMessageBox.information(self, "Add cards", "Select one or more cards first.")
+            return
+        self._add_rows(selected_rows)
+
+    def _add_rows(self, rows: list[int]) -> None:
+        added_cards: list[dict] = []
+        for row in rows:
+            if 0 <= row < len(self.search_results):
+                card = self.search_results[row]
+                self.database.add_card(card)
+                added_cards.append(card)
+
+        if not added_cards:
+            return
+
+        self.refresh_inventory()
+        if len(added_cards) == 1:
+            card = added_cards[0]
+            self.statusBar().showMessage(
+                f"Added {card['name']} — {card['set_name']} {card['number']}"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Added {len(added_cards)} selected cards to inventory"
+            )
 
     def refresh_inventory(self) -> None:
         self.inventory_rows = self.database.list_inventory()
