@@ -12,6 +12,7 @@ class InventoryDatabase:
         data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation))
         data_dir.mkdir(parents=True, exist_ok=True)
         self.path = data_dir / "inventory.db"
+        self.catalog_path = data_dir / "pokemon_catalog.db"
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -42,6 +43,58 @@ class InventoryDatabase:
             if "card_category" not in existing:
                 connection.execute("ALTER TABLE inventory ADD COLUMN card_category TEXT")
 
+    def sync_catalog_metadata(self) -> int:
+        """Refresh immutable card details for existing inventory rows from the local catalog."""
+        if not self.catalog_path.exists():
+            return 0
+
+        with self._connect() as connection:
+            connection.execute("ATTACH DATABASE ? AS catalog_db", (str(self.catalog_path),))
+            try:
+                before = connection.total_changes
+                connection.execute(
+                    """
+                    UPDATE inventory
+                    SET card_name = COALESCE(
+                            (SELECT c.card_name FROM catalog_db.cards c
+                             WHERE c.card_id = inventory.card_id),
+                            card_name
+                        ),
+                        set_name = COALESCE(
+                            (SELECT c.set_name FROM catalog_db.cards c
+                             WHERE c.card_id = inventory.card_id),
+                            set_name
+                        ),
+                        set_code = COALESCE(
+                            NULLIF((SELECT c.set_code FROM catalog_db.cards c
+                                    WHERE c.card_id = inventory.card_id), ''),
+                            set_code
+                        ),
+                        rarity = COALESCE(
+                            NULLIF((SELECT c.rarity FROM catalog_db.cards c
+                                    WHERE c.card_id = inventory.card_id), ''),
+                            rarity
+                        ),
+                        image_url = COALESCE(
+                            NULLIF((SELECT c.image_url FROM catalog_db.cards c
+                                    WHERE c.card_id = inventory.card_id), ''),
+                            image_url
+                        ),
+                        card_category = COALESCE(
+                            NULLIF((SELECT c.card_category FROM catalog_db.cards c
+                                    WHERE c.card_id = inventory.card_id), ''),
+                            card_category
+                        )
+                    WHERE EXISTS (
+                        SELECT 1 FROM catalog_db.cards c
+                        WHERE c.card_id = inventory.card_id
+                    )
+                    """
+                )
+                return connection.total_changes - before
+            finally:
+                connection.execute("DETACH DATABASE catalog_db")
+
     def add_card(self, card: dict[str, Any], quantity: int = 1) -> None:
         quantity = max(1, int(quantity))
         with self._connect() as connection:
@@ -67,6 +120,8 @@ class InventoryDatabase:
             )
 
     def list_inventory(self) -> list[dict[str, Any]]:
+        # Keep existing inventory rows enriched as catalog updates finish page by page.
+        self.sync_catalog_metadata()
         with self._connect() as connection:
             rows = connection.execute(
                 """
