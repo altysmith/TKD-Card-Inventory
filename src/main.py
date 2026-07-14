@@ -59,13 +59,13 @@ class MainWindow(QMainWindow):
         self.name_input.setPlaceholderText("Card name, e.g. Charizard ex")
         self.number_input = QLineEdit()
         self.number_input.setPlaceholderText("Collector number, e.g. 125")
-        search_button = QPushButton("Search")
-        search_button.clicked.connect(self.search_cards)
+        self.search_button = QPushButton("Search")
+        self.search_button.clicked.connect(self.search_cards)
         self.name_input.returnPressed.connect(self.search_cards)
         self.number_input.returnPressed.connect(self.search_cards)
         controls.addWidget(self.name_input, 2)
         controls.addWidget(self.number_input, 1)
-        controls.addWidget(search_button)
+        controls.addWidget(self.search_button)
         layout.addLayout(controls)
 
         selection_help = QLabel(
@@ -152,15 +152,26 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Search", "Enter a card name or collector number.")
             return
 
+        # Clear the old result set immediately so a failed search cannot leave stale cards
+        # available for selection and accidental inventory additions.
+        self.search_results = []
+        self.results_table.clearContents()
+        self.results_table.setRowCount(0)
+        self.search_button.setEnabled(False)
+        self.statusBar().showMessage("Searching the Pokémon card catalog...")
+
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            self.search_results = self.api.search_cards(name, number)
+            results = self.api.search_cards(name, number)
         except Exception as exc:
-            QMessageBox.critical(self, "Search failed", str(exc))
+            self.statusBar().showMessage("Search failed")
+            QMessageBox.warning(self, "Search failed", str(exc))
             return
         finally:
             QApplication.restoreOverrideCursor()
+            self.search_button.setEnabled(True)
 
+        self.search_results = results
         self.results_table.setRowCount(len(self.search_results))
         for row_index, card in enumerate(self.search_results):
             values = [
@@ -173,7 +184,11 @@ class MainWindow(QMainWindow):
             for column, value in enumerate(values):
                 self.results_table.setItem(row_index, column, QTableWidgetItem(str(value)))
         self.results_table.resizeColumnsToContents()
-        self.statusBar().showMessage(f"Found {len(self.search_results)} matching cards")
+
+        if self.search_results:
+            self.statusBar().showMessage(f"Found {len(self.search_results)} matching cards")
+        else:
+            self.statusBar().showMessage("No matching cards found")
 
     def add_current_card(self) -> None:
         row = self.results_table.currentRow()
