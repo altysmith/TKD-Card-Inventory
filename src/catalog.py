@@ -114,6 +114,14 @@ class PokemonCatalog:
                 (key, value),
             )
 
+    def get_metadata(self, key: str, default: str | None = None) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM catalog_metadata WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return str(row["value"]) if row is not None else default
+
     def search_cards(self, name: str, number: str = "", limit: int = 100) -> list[dict[str, Any]]:
         clauses: list[str] = []
         parameters: list[Any] = []
