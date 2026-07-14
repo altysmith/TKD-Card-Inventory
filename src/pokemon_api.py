@@ -15,15 +15,24 @@ class PokemonTCGClient:
     def __init__(self) -> None:
         self.api_key = os.getenv("POKEMON_TCG_API_KEY", "").strip()
         self.session = requests.Session()
+        self._cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
     def search_cards(self, name: str, number: str = "") -> list[dict[str, Any]]:
+        clean_name = name.strip()
+        clean_number = number.strip().split("/")[0]
+        cache_key = (clean_name.casefold(), clean_number.casefold())
+
+        if cache_key in self._cache:
+            return [card.copy() for card in self._cache[cache_key]]
+
         query_parts: list[str] = []
-        if name.strip():
-            safe_name = name.strip().replace('"', "")
-            query_parts.append(f'name:"{safe_name}*"')
-        if number.strip():
-            safe_number = number.strip().split("/")[0]
-            query_parts.append(f'number:"{safe_number}"')
+        if clean_name:
+            safe_name = clean_name.replace('"', "")
+            # Avoid a trailing wildcard here. Wildcard searches are considerably slower
+            # on the remote catalog and commonly caused first-search timeouts.
+            query_parts.append(f'name:"{safe_name}"')
+        if clean_number:
+            query_parts.append(f'number:"{clean_number}"')
 
         if not query_parts:
             return []
@@ -35,17 +44,18 @@ class PokemonTCGClient:
                 params={
                     "q": " ".join(query_parts),
                     "pageSize": 50,
-                    "orderBy": "name,set.releaseDate",
-                    "select": "id,name,number,rarity,set,images",
+                    # The current table does not display card artwork, so excluding images
+                    # keeps the response substantially smaller and faster.
+                    "select": "id,name,number,rarity,set",
                 },
                 headers=headers,
-                timeout=(4, 8),
+                timeout=(4, 12),
             )
             response.raise_for_status()
         except requests.Timeout as exc:
             raise RuntimeError(
-                "The Pokémon TCG API did not respond within 8 seconds. "
-                "Please try again."
+                "The Pokémon TCG catalog is responding too slowly. "
+                "The app stayed responsive, but this search did not finish. Please try again."
             ) from exc
         except requests.ConnectionError as exc:
             raise RuntimeError(
@@ -63,7 +73,6 @@ class PokemonTCGClient:
         cards: list[dict[str, Any]] = []
         for raw in response.json().get("data", []):
             card_set = raw.get("set", {})
-            images = raw.get("images", {})
             printed_total = card_set.get("printedTotal") or card_set.get("total")
             display_number = raw.get("number", "")
             if printed_total:
@@ -78,7 +87,9 @@ class PokemonTCGClient:
                     "rarity": raw.get("rarity", ""),
                     "set_name": card_set.get("name", "Unknown Set"),
                     "set_code": card_set.get("ptcgoCode") or card_set.get("id", ""),
-                    "image_url": images.get("small") or images.get("large", ""),
+                    "image_url": "",
                 }
             )
+
+        self._cache[cache_key] = [card.copy() for card in cards]
         return cards
