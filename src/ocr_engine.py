@@ -30,7 +30,12 @@ class OCRResult:
 
 
 class CardOCREngine:
-    """Recognize a modern card from one focused printed identifier line."""
+    """Recognize a modern card from one focused printed identifier line.
+
+    The collector fraction is treated as the primary identifier because the local
+    catalog can often resolve an exact printing from number + printed total even
+    when one of the tiny set-code letters is misread.
+    """
 
     CARD_ASPECT_RATIO = 0.714
     SET_CODE = re.compile(r"(?<![A-Z])([A-Z]{3})(?![A-Z])")
@@ -63,20 +68,24 @@ class CardOCREngine:
 
     @staticmethod
     def _identifier_strip(area: Any, mode: str) -> Any:
-        """Crop one short line containing both the printed set code and fraction."""
         height, width = area.shape[:2]
         if mode == "identifier":
             return area[
                 int(height * 0.58) : int(height * 0.94),
                 int(width * 0.02) : int(width * 0.62),
             ].copy()
-
-        # Modern English cards place the three-letter acronym and fraction on one
-        # line in the extreme lower-left. Keep only that line and avoid the nearby
-        # copyright and illustrator text.
         return area[
             int(height * 0.900) : int(height * 0.972),
             int(width * 0.035) : int(width * 0.47),
+        ].copy()
+
+    @staticmethod
+    def _number_region(identifier: Any) -> Any:
+        """Focus a second OCR pass on the collector fraction within the same strip."""
+        height, width = identifier.shape[:2]
+        return identifier[
+            0:height,
+            int(width * 0.30) : int(width * 0.96),
         ].copy()
 
     @staticmethod
@@ -99,8 +108,7 @@ class CardOCREngine:
         return cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
     @staticmethod
-    def _read(image: Any, psm: int) -> tuple[str, list[float]]:
-        whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/ "
+    def _read(image: Any, psm: int, whitelist: str) -> tuple[str, list[float]]:
         config = f"--oem 3 --psm {psm} -c tessedit_char_whitelist={whitelist}"
         data = pytesseract.image_to_data(image, output_type=Output.DICT, config=config)
         words: list[str] = []
@@ -119,8 +127,7 @@ class CardOCREngine:
     @staticmethod
     def _normalize(text: str) -> str:
         normalized = text.upper().replace("|", "/").replace("\\", "/")
-        normalized = re.sub(r"\s+", " ", normalized).strip()
-        return normalized
+        return re.sub(r"\s+", " ", normalized).strip()
 
     @staticmethod
     def _numeric_normalize(text: str) -> str:
@@ -142,10 +149,8 @@ class CardOCREngine:
         for text, _ in attempts:
             normalized = self._normalize(text)
             numeric = self._numeric_normalize(text)
-
             code_match = self.SET_CODE.search(normalized)
             fraction_match = self.COLLECTOR_FRACTION.search(numeric)
-
             code = code_match.group(1) if code_match else ""
             collector = ""
             total: int | None = None
@@ -155,7 +160,6 @@ class CardOCREngine:
                 if 0 <= collector_value <= 999 and 1 <= total_value <= 999:
                     collector = str(collector_value)
                     total = total_value
-
             if code and collector:
                 return code, collector, total, text
             if collector and not best_fraction:
@@ -166,7 +170,6 @@ class CardOCREngine:
                 best_code = code
                 if not best_text:
                     best_text = text
-
         return best_code, best_fraction, best_total, best_text
 
     @staticmethod
@@ -204,35 +207,57 @@ class CardOCREngine:
         started = time.perf_counter()
         area = self.crop_guided_area(frame, mode)
         identifier = self._identifier_strip(area, mode)
+        number_region = self._number_region(identifier)
         gray_identifier = cv2.cvtColor(identifier, cv2.COLOR_BGR2GRAY)
         sharpness = float(cv2.Laplacian(gray_identifier, cv2.CV_64F).var())
         capture_quality = self._capture_quality(identifier, sharpness)
 
         scale = 12.0 if enhanced else 10.0
         processed = self._prepare(identifier, scale, threshold=enhanced)
-        attempts = [self._read(processed, 7), self._read(processed, 13)]
+        number_processed = self._prepare(number_region, scale + 2.0, threshold=enhanced)
+
+        # General line passes help read the set code. Number-only passes deliberately
+        # ignore letters so the clearer fraction can drive catalog lookup.
+        general_attempts = [
+            self._read(processed, 7, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/ "),
+            self._read(processed, 13, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/ "),
+        ]
+        number_attempts = [
+            self._read(number_processed, 7, "0123456789/"),
+            self._read(number_processed, 13, "0123456789/"),
+            self._read(number_processed, 6, "0123456789/"),
+        ]
         if enhanced:
-            attempts.extend(
+            general_attempts.extend(
                 [
-                    self._read(cv2.bitwise_not(processed), 7),
-                    self._read(cv2.bitwise_not(processed), 11),
+                    self._read(cv2.bitwise_not(processed), 7, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/ "),
+                    self._read(cv2.bitwise_not(processed), 11, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/ "),
+                ]
+            )
+            number_attempts.extend(
+                [
+                    self._read(cv2.bitwise_not(number_processed), 7, "0123456789/"),
+                    self._read(cv2.bitwise_not(number_processed), 11, "0123456789/"),
                 ]
             )
 
-        set_code, collector_number, printed_total, matched_text = self._parse_attempts(attempts)
+        all_attempts = general_attempts + number_attempts
+        set_code, collector_number, printed_total, matched_text = self._parse_attempts(all_attempts)
         matched_confidence = 0
-        for text, confidences in attempts:
+        for text, confidences in all_attempts:
             if text == matched_text:
                 matched_confidence = self._average_confidence(confidences)
                 break
 
-        texts = [text for text, _ in attempts if text]
+        texts = [text for text, _ in all_attempts if text]
         evidence = self._text_evidence(texts)
 
         if set_code and collector_number and printed_total:
-            confidence = max(96, matched_confidence)
+            confidence = max(97, matched_confidence)
         elif collector_number and printed_total:
-            confidence = max(80, int(round(matched_confidence * 0.65 + capture_quality * 0.35)))
+            # A clean collector fraction is enough to query the local database. The
+            # scanner will only auto-accept when that query returns one exact printing.
+            confidence = max(93, int(round(matched_confidence * 0.55 + capture_quality * 0.45)))
         elif set_code:
             confidence = max(55, int(round(matched_confidence * 0.60 + capture_quality * 0.40)))
         else:
@@ -243,11 +268,15 @@ class CardOCREngine:
         raw_lines = [
             f"Capture quality: {capture_quality}%",
             f"Identifier evidence: {evidence}%",
-            "Single crop: green border = set code + collector fraction",
-            "OCR attempts:",
+            "Recognition strategy: collector fraction first, set code second, catalog validation after OCR",
+            "Full identifier attempts:",
         ]
         raw_lines.extend(
-            f"  {index + 1}: {text or '<nothing>'}" for index, (text, _) in enumerate(attempts)
+            f"  {index + 1}: {text or '<nothing>'}" for index, (text, _) in enumerate(general_attempts)
+        )
+        raw_lines.append("Number-only attempts:")
+        raw_lines.extend(
+            f"  {index + 1}: {text or '<nothing>'}" for index, (text, _) in enumerate(number_attempts)
         )
 
         return OCRResult(
