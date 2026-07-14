@@ -38,8 +38,6 @@ class PokemonCatalog:
 
                 CREATE INDEX IF NOT EXISTS idx_cards_name
                     ON cards(card_name COLLATE NOCASE);
-                CREATE INDEX IF NOT EXISTS idx_cards_set_name
-                    ON cards(set_name COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_cards_set_code_number
                     ON cards(set_code COLLATE NOCASE, collector_number_numeric);
                 CREATE INDEX IF NOT EXISTS idx_cards_number
@@ -49,6 +47,19 @@ class PokemonCatalog:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                """
+            )
+
+            # The API commonly supplies its internal set ID (sv3pt5) for
+            # Scarlet & Violet—151 instead of the familiar set abbreviation MEW.
+            # Apply this lightweight migration on startup so existing catalogs do
+            # not need to be downloaded again.
+            connection.execute(
+                """
+                UPDATE cards
+                SET set_code = 'MEW', updated_at = CURRENT_TIMESTAMP
+                WHERE LOWER(set_code) = 'sv3pt5'
+                   OR LOWER(set_name) IN ('151', 'scarlet & violet—151', 'scarlet & violet-151')
                 """
             )
 
@@ -126,7 +137,7 @@ class PokemonCatalog:
 
     def search_cards(
         self,
-        name: str = "",
+        name: str,
         number: str = "",
         set_query: str = "",
         limit: int = 100,
@@ -142,8 +153,8 @@ class PokemonCatalog:
             clauses.append(
                 "(set_name LIKE ? COLLATE NOCASE OR set_code LIKE ? COLLATE NOCASE)"
             )
-            set_value = f"%{set_query.strip()}%"
-            parameters.extend([set_value, set_value])
+            set_pattern = f"%{set_query.strip()}%"
+            parameters.extend([set_pattern, set_pattern])
 
         if number.strip():
             raw_number = number.strip().split("/")[0]
@@ -164,10 +175,10 @@ class PokemonCatalog:
                    printed_total, rarity, image_url
             FROM cards
             WHERE {' AND '.join(clauses)}
-            ORDER BY set_name COLLATE NOCASE,
+            ORDER BY card_name COLLATE NOCASE,
+                     set_name COLLATE NOCASE,
                      collector_number_numeric,
-                     collector_number,
-                     card_name COLLATE NOCASE
+                     collector_number
             LIMIT ?
         """
 
