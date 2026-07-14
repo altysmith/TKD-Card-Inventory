@@ -5,6 +5,8 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv()
 
@@ -14,6 +16,16 @@ class PokemonTCGClient:
 
     def __init__(self) -> None:
         self.api_key = os.getenv("POKEMON_TCG_API_KEY", "").strip()
+        self.session = requests.Session()
+        retry_policy = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry_policy))
 
     def search_cards(self, name: str, number: str = "") -> list[dict[str, Any]]:
         query_parts: list[str] = []
@@ -28,18 +40,36 @@ class PokemonTCGClient:
             return []
 
         headers = {"X-Api-Key": self.api_key} if self.api_key else {}
-        response = requests.get(
-            self.BASE_URL,
-            params={
-                "q": " ".join(query_parts),
-                "pageSize": 50,
-                "orderBy": "name,set.releaseDate",
-                "select": "id,name,number,rarity,set,images",
-            },
-            headers=headers,
-            timeout=20,
-        )
-        response.raise_for_status()
+        try:
+            response = self.session.get(
+                self.BASE_URL,
+                params={
+                    "q": " ".join(query_parts),
+                    "pageSize": 50,
+                    "orderBy": "name,set.releaseDate",
+                    "select": "id,name,number,rarity,set,images",
+                },
+                headers=headers,
+                timeout=(5, 45),
+            )
+            response.raise_for_status()
+        except requests.Timeout as exc:
+            raise RuntimeError(
+                "The Pokémon TCG API took too long to respond after several attempts. "
+                "Please try the search again in a moment."
+            ) from exc
+        except requests.ConnectionError as exc:
+            raise RuntimeError(
+                "The Pokémon TCG API could not be reached. Check your internet connection "
+                "and try again."
+            ) from exc
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            raise RuntimeError(
+                f"The Pokémon TCG API returned an error (HTTP {status}). Please try again."
+            ) from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Card search failed: {exc}") from exc
 
         cards: list[dict[str, Any]] = []
         for raw in response.json().get("data", []):
