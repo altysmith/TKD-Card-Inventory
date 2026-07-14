@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import cv2
@@ -100,16 +101,31 @@ class SettingsTab(QWidget):
         root.addLayout(buttons)
         root.addStretch()
 
+    @staticmethod
+    def _open_camera(index: int) -> cv2.VideoCapture:
+        if sys.platform == "darwin":
+            return cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+        if sys.platform.startswith("win"):
+            return cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        return cv2.VideoCapture(index)
+
     def detect_cameras(self) -> None:
         current = int(self.settings.value("scanner/camera_index", 0))
         found: list[int] = []
         self.detect_button.setEnabled(False)
+
+        # AVFoundation reports the valid device range directly and prints noisy errors
+        # for every out-of-range index. Most Macs expose only indexes 0 and 1, so avoid
+        # probing six nonexistent cameras. Other platforms retain a broader search.
+        max_indexes = 2 if sys.platform == "darwin" else 6
         try:
-            for index in range(8):
-                camera = cv2.VideoCapture(index)
+            for index in range(max_indexes):
+                camera = self._open_camera(index)
                 try:
                     if camera.isOpened():
-                        found.append(index)
+                        ok, _ = camera.read()
+                        if ok:
+                            found.append(index)
                 finally:
                     camera.release()
         finally:
