@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 from PySide6.QtCore import QThread, Qt, QTimer
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -27,13 +28,14 @@ from .catalog import PokemonCatalog
 from .catalog_worker import CatalogDownloadWorker
 from .database import InventoryDatabase
 from .pokemon_api import PokemonTCGClient
+from .scanner_tab import ScannerTab
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("TKD Card Inventory")
-        self.resize(1100, 700)
+        self.resize(1250, 820)
 
         self.database = InventoryDatabase()
         self.catalog = PokemonCatalog()
@@ -44,6 +46,8 @@ class MainWindow(QMainWindow):
         self.catalog_worker: CatalogDownloadWorker | None = None
 
         self.tabs = QTabWidget()
+        self.scanner_tab = ScannerTab(self.catalog, self.database, self.refresh_inventory)
+        self.tabs.addTab(self.scanner_tab, "Scanner")
         self.tabs.addTab(self._build_search_tab(), "Find & Add Cards")
         self.tabs.addTab(self._build_inventory_tab(), "Inventory")
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -77,23 +81,32 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Card name, e.g. Metagross")
+        self.set_input = QLineEdit()
+        self.set_input.setPlaceholderText("Set name or code, e.g. Temporal Forces or TEF")
         self.number_input = QLineEdit()
         self.number_input.setPlaceholderText("Collector number, e.g. 125")
         self.search_button = QPushButton("Search")
         self.search_button.clicked.connect(self.search_cards)
         self.name_input.returnPressed.connect(self.search_cards)
+        self.set_input.returnPressed.connect(self.search_cards)
         self.number_input.returnPressed.connect(self.search_cards)
         controls.addWidget(self.name_input, 2)
+        controls.addWidget(self.set_input, 2)
         controls.addWidget(self.number_input, 1)
         controls.addWidget(self.search_button)
         layout.addLayout(controls)
 
-        help_label = QLabel("Select multiple rows with Ctrl+Click, or a range with Shift+Click.")
+        help_label = QLabel(
+            "Search by any combination of card name, set name/code, and collector number. "
+            "Select multiple rows with Ctrl+Click or Shift+Click."
+        )
         help_label.setStyleSheet("color: #888888;")
         layout.addWidget(help_label)
 
-        self.results_table = QTableWidget(0, 5)
-        self.results_table.setHorizontalHeaderLabels(["Card", "Set", "Number", "Rarity", "Card ID"])
+        self.results_table = QTableWidget(0, 6)
+        self.results_table.setHorizontalHeaderLabels(
+            ["Card", "Set", "Set Code", "Number", "Rarity", "Card ID"]
+        )
         self.results_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.results_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.results_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -169,6 +182,7 @@ class MainWindow(QMainWindow):
         ready = count > 0
         self.search_button.setEnabled(ready)
         self.name_input.setEnabled(ready)
+        self.set_input.setEnabled(ready)
         self.number_input.setEnabled(ready)
         self.add_cards_button.setEnabled(ready and bool(self.search_results))
         self.catalog_button.setText("Update Card Catalog" if ready else "Download Card Catalog")
@@ -212,7 +226,9 @@ class MainWindow(QMainWindow):
         )
 
     def _catalog_downloaded(self, imported: int) -> None:
-        self.catalog_status.setText(f"Catalog ready. {self.catalog.card_count():,} cards available offline.")
+        self.catalog_status.setText(
+            f"Catalog ready. {self.catalog.card_count():,} cards available offline."
+        )
         QMessageBox.information(
             self,
             "Catalog Ready",
@@ -236,20 +252,36 @@ class MainWindow(QMainWindow):
 
     def search_cards(self) -> None:
         name = self.name_input.text().strip()
+        set_query = self.set_input.text().strip()
         number = self.number_input.text().strip()
-        if not name and not number:
-            QMessageBox.information(self, "Search", "Enter a card name or collector number.")
+        if not name and not set_query and not number:
+            QMessageBox.information(
+                self,
+                "Search",
+                "Enter a card name, set name/code, or collector number.",
+            )
             return
         if not self.catalog.is_ready():
             QMessageBox.information(self, "Catalog Required", "Download the local card catalog first.")
             return
-        self.search_results = self.catalog.search_cards(name, number)
+        self.search_results = self.catalog.search_cards(
+            name=name,
+            number=number,
+            set_query=set_query,
+        )
         self._show_search_results(self.search_results)
 
     def _show_search_results(self, results: list[dict]) -> None:
         self.results_table.setRowCount(len(results))
         for row_index, card in enumerate(results):
-            values = [card["name"], card["set_name"], card["number"], card.get("rarity", ""), card["id"]]
+            values = [
+                card["name"],
+                card["set_name"],
+                card.get("set_code", ""),
+                card["number"],
+                card.get("rarity", ""),
+                card["id"],
+            ]
             for column, value in enumerate(values):
                 self.results_table.setItem(row_index, column, QTableWidgetItem(str(value)))
         self.results_table.resizeColumnsToContents()
@@ -278,7 +310,9 @@ class MainWindow(QMainWindow):
             self.database.add_card(card)
         if cards:
             self.refresh_inventory()
-            self.statusBar().showMessage(f"Added {len(cards)} card{'s' if len(cards) != 1 else ''} to inventory")
+            self.statusBar().showMessage(
+                f"Added {len(cards)} card{'s' if len(cards) != 1 else ''} to inventory"
+            )
 
     def refresh_inventory(self) -> None:
         selected_id = None
@@ -289,7 +323,15 @@ class MainWindow(QMainWindow):
         self.inventory_table.setRowCount(len(self.inventory_rows))
         reselect = -1
         for row_index, card in enumerate(self.inventory_rows):
-            values = [card["card_name"], card["set_name"], card["set_code"], card["collector_number"], card["rarity"], card["quantity"], card["card_id"]]
+            values = [
+                card["card_name"],
+                card["set_name"],
+                card["set_code"],
+                card["collector_number"],
+                card["rarity"],
+                card["quantity"],
+                card["card_id"],
+            ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value or ""))
                 if column == 5:
@@ -330,7 +372,10 @@ class MainWindow(QMainWindow):
         row = self._selected_inventory_row()
         if row < 0:
             return
-        self.database.set_quantity(self.inventory_rows[row]["card_id"], self.quantity_input.value())
+        self.database.set_quantity(
+            self.inventory_rows[row]["card_id"],
+            self.quantity_input.value(),
+        )
         self.refresh_inventory()
 
     def export_inventory(self, file_type: str) -> None:
@@ -346,15 +391,22 @@ class MainWindow(QMainWindow):
         path = Path(filename)
         try:
             frame = pd.DataFrame(rows)
-            frame.to_csv(path, index=False) if file_type == "csv" else frame.to_excel(path, index=False, sheet_name="Inventory")
+            if file_type == "csv":
+                frame.to_csv(path, index=False)
+            else:
+                frame.to_excel(path, index=False, sheet_name="Inventory")
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
             return
         QMessageBox.information(self, "Export complete", f"Inventory exported to:\n{path}")
 
     def _on_tab_changed(self, index: int) -> None:
-        if index == 1:
+        if index == 2:
             self.refresh_inventory()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.scanner_tab.shutdown()
+        super().closeEvent(event)
 
 
 def main() -> int:
