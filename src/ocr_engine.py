@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,23 +23,22 @@ class OCRResult:
     printed_total: int | None = None
     confidence: int = 0
     raw_text: str = ""
+    processing_ms: int = 0
+    sharpness: float = 0.0
+    crop_image: Any = None
+    processed_image: Any = None
 
 
 class CardOCREngine:
-    """Read card titles and identifier regions from temporary scanner frames."""
+    """Fast targeted OCR with temporary debug images returned to the UI."""
 
     CARD_ASPECT_RATIO = 0.714
-    STANDARD_NUMBER = re.compile(
-        r"\b([A-Z]{0,3}\d{1,3})\s*[/|]\s*(\d{1,3})\b", re.IGNORECASE
-    )
+    STANDARD_NUMBER = re.compile(r"\b([A-Z]{0,3}\d{1,3})\s*[/|]\s*(\d{1,3})\b", re.I)
     CODE_AND_NUMBER = re.compile(
-        r"\b([A-Z]{2,6})\s*[- ]?\s*(\d{1,3})\s*[/|]\s*(\d{1,3})\b",
-        re.IGNORECASE,
+        r"\b([A-Z]{2,6})\s*[- ]?\s*(\d{1,3})\s*[/|]\s*(\d{1,3})\b", re.I
     )
-    PROMO_NUMBER = re.compile(
-        r"\b(SVP|SWSH|SM|XY|BW|MEP)\s*[- ]?\s*(\d{1,3})\b", re.IGNORECASE
-    )
-    GALLERY_NUMBER = re.compile(r"\b(TG|GG|RC)\s*(\d{1,3})\b", re.IGNORECASE)
+    PROMO_NUMBER = re.compile(r"\b(SVP|SWSH|SM|XY|BW|MEP)\s*[- ]?\s*(\d{1,3})\b", re.I)
+    GALLERY_NUMBER = re.compile(r"\b(TG|GG|RC)\s*(\d{1,3})\b", re.I)
 
     def available(self) -> bool:
         if pytesseract is None:
@@ -66,24 +66,11 @@ class CardOCREngine:
         return frame[top : top + guide_height, left : left + guide_width].copy()
 
     @staticmethod
-    def _variants(image: Any, scale: float) -> list[Any]:
+    def _prepare_identifier(image: Any, scale: float) -> Any:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(normalized)
-        denoised = cv2.bilateralFilter(clahe, 7, 45, 45)
-        sharpened = cv2.addWeighted(
-            denoised, 2.2, cv2.GaussianBlur(denoised, (0, 0), 1.3), -1.2, 0
-        )
-        adaptive = cv2.adaptiveThreshold(
-            sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 31, 7,
-        )
-        _, otsu = cv2.threshold(
-            sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-        inverted = cv2.bitwise_not(adaptive)
-        return [clahe, sharpened, adaptive, otsu, inverted]
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
+        return cv2.addWeighted(clahe, 1.7, cv2.GaussianBlur(clahe, (0, 0), 1.2), -0.7, 0)
 
     @staticmethod
     def _read(image: Any, psm: int, whitelist: str = "") -> tuple[str, list[float]]:
@@ -108,10 +95,7 @@ class CardOCREngine:
     def _clean_name(text: str) -> str:
         text = re.sub(r"[^A-Za-z0-9 .:'\-éÉ♀♂]", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
-        text = re.sub(
-            r"\b(?:BASIC|STAGE\s*[12]|TRAINER|ENERGY|HP\s*\d+)\b",
-            "", text, flags=re.I,
-        )
+        text = re.sub(r"\b(?:BASIC|STAGE\s*[12]|TRAINER|ENERGY|HP\s*\d+)\b", "", text, flags=re.I)
         return re.sub(r"\s+", " ", text).strip(" -")
 
     def _find_identifiers(self, texts: list[str]) -> tuple[str, str, int | None, str]:
@@ -131,64 +115,59 @@ class CardOCREngine:
                 return "", f"{match.group(1)}{match.group(2)}", None, text
         return "", "", None, ""
 
-    def read_card(self, frame: Any, mode: str = "full") -> OCRResult:
+    def read_card(self, frame: Any, mode: str = "full", enhanced: bool = False) -> OCRResult:
         if not self.available():
             raise RuntimeError(
                 "Tesseract OCR is not installed or cannot be found. Install Tesseract, then restart the app."
             )
 
+        started = time.perf_counter()
         area = self.crop_guided_area(frame, mode)
+        sharpness = float(cv2.Laplacian(cv2.cvtColor(area, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
         height, width = area.shape[:2]
+
         if mode == "identifier":
-            top_region = area[0:1, 0:1]
-            bottom_region = area
+            identifier_region = area
+            title_region = None
         else:
-            top_region = area[0 : max(1, int(height * 0.16)), 0:width]
-            bottom_region = area[int(height * 0.67) : int(height * 0.99), 0:width]
+            title_region = area[0 : max(1, int(height * 0.16)), 0:width]
+            identifier_region = area[int(height * 0.64) : int(height * 0.99), 0:width]
 
-        top_candidates: list[tuple[str, list[float]]] = [("", [])]
-        if mode != "identifier":
-            for variant in self._variants(top_region, 4.0):
-                top_candidates.append(self._read(variant, 7))
-                top_candidates.append(self._read(variant, 11))
-
-        bottom_candidates: list[tuple[str, list[float]]] = []
+        scale = 4.5 if mode == "identifier" else 4.0
+        processed = self._prepare_identifier(identifier_region, scale)
         whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/- "
-        scale = 6.5 if mode == "identifier" else 5.2
-        for variant in self._variants(bottom_region, scale):
-            for psm in (6, 7, 11, 12, 13):
-                bottom_candidates.append(self._read(variant, psm, whitelist))
 
-        top_text, top_conf = max(
-            top_candidates,
-            key=lambda item: (sum(item[1]) / len(item[1])) if item[1] else -1,
-        )
-        bottom_texts = [text for text, _ in bottom_candidates]
-        set_code, collector_number, printed_total, matched_text = self._find_identifiers(bottom_texts)
+        attempts = [self._read(processed, 7, whitelist), self._read(processed, 11, whitelist)]
+        if enhanced:
+            _, binary = cv2.threshold(processed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            attempts.extend([self._read(binary, 6, whitelist), self._read(binary, 12, whitelist)])
 
+        texts = [text for text, _ in attempts]
+        set_code, collector_number, printed_total, matched_text = self._find_identifiers(texts)
         if matched_text:
-            bottom_text, bottom_conf = next(
-                ((text, conf) for text, conf in bottom_candidates if text == matched_text),
-                (matched_text, []),
+            identifier_text, identifier_conf = next(
+                ((text, conf) for text, conf in attempts if text == matched_text), (matched_text, [])
             )
         else:
-            bottom_text, bottom_conf = max(
-                bottom_candidates,
-                key=lambda item: (sum(item[1]) / len(item[1])) if item[1] else -1,
+            identifier_text, identifier_conf = max(
+                attempts, key=lambda item: (sum(item[1]) / len(item[1])) if item[1] else -1
             )
 
-        card_name = self._clean_name(top_text)
-        if len(card_name.split()) > 4:
-            card_name = " ".join(card_name.split()[:4])
+        card_name = ""
+        title_text = ""
+        title_conf: list[float] = []
+        if title_region is not None:
+            title_processed = self._prepare_identifier(title_region, 3.0)
+            title_text, title_conf = self._read(title_processed, 7)
+            card_name = self._clean_name(title_text)
+            if len(card_name.split()) > 4:
+                card_name = " ".join(card_name.split()[:4])
 
-        identifier_conf = [score for score in bottom_conf if score >= 0]
-        title_conf = [score for score in top_conf if score >= 0]
-        if identifier_conf:
-            confidence = int(round(sum(identifier_conf) / len(identifier_conf)))
-        elif title_conf:
-            confidence = int(round(sum(title_conf) / len(title_conf)))
-        else:
-            confidence = 0
+        scores = [score for score in identifier_conf if score >= 0]
+        if not scores:
+            scores = [score for score in title_conf if score >= 0]
+        confidence = int(round(sum(scores) / len(scores))) if scores else 0
+        elapsed = int(round((time.perf_counter() - started) * 1000))
 
         return OCRResult(
             card_name=card_name,
@@ -196,5 +175,9 @@ class CardOCREngine:
             collector_number=collector_number,
             printed_total=printed_total,
             confidence=max(0, min(100, confidence)),
-            raw_text=f"{top_text}\n{bottom_text}".strip(),
+            raw_text=f"Identifier: {identifier_text}\nTitle: {title_text}".strip(),
+            processing_ms=elapsed,
+            sharpness=sharpness,
+            crop_image=identifier_region.copy(),
+            processed_image=processed.copy(),
         )
