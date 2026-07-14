@@ -48,52 +48,55 @@ class InventoryDatabase:
         if not self.catalog_path.exists():
             return 0
 
-        with self._connect() as connection:
+        connection = self._connect()
+        try:
             connection.execute("ATTACH DATABASE ? AS catalog_db", (str(self.catalog_path),))
-            try:
-                before = connection.total_changes
-                connection.execute(
-                    """
-                    UPDATE inventory
-                    SET card_name = COALESCE(
-                            (SELECT c.card_name FROM catalog_db.cards c
-                             WHERE c.card_id = inventory.card_id),
-                            card_name
-                        ),
-                        set_name = COALESCE(
-                            (SELECT c.set_name FROM catalog_db.cards c
-                             WHERE c.card_id = inventory.card_id),
-                            set_name
-                        ),
-                        set_code = COALESCE(
-                            NULLIF((SELECT c.set_code FROM catalog_db.cards c
-                                    WHERE c.card_id = inventory.card_id), ''),
-                            set_code
-                        ),
-                        rarity = COALESCE(
-                            NULLIF((SELECT c.rarity FROM catalog_db.cards c
-                                    WHERE c.card_id = inventory.card_id), ''),
-                            rarity
-                        ),
-                        image_url = COALESCE(
-                            NULLIF((SELECT c.image_url FROM catalog_db.cards c
-                                    WHERE c.card_id = inventory.card_id), ''),
-                            image_url
-                        ),
-                        card_category = COALESCE(
-                            NULLIF((SELECT c.card_category FROM catalog_db.cards c
-                                    WHERE c.card_id = inventory.card_id), ''),
-                            card_category
-                        )
-                    WHERE EXISTS (
-                        SELECT 1 FROM catalog_db.cards c
-                        WHERE c.card_id = inventory.card_id
+            before = connection.total_changes
+            connection.execute(
+                """
+                UPDATE inventory
+                SET card_name = COALESCE(
+                        (SELECT c.card_name FROM catalog_db.cards c
+                         WHERE c.card_id = inventory.card_id),
+                        card_name
+                    ),
+                    set_name = COALESCE(
+                        (SELECT c.set_name FROM catalog_db.cards c
+                         WHERE c.card_id = inventory.card_id),
+                        set_name
+                    ),
+                    set_code = COALESCE(
+                        NULLIF((SELECT c.set_code FROM catalog_db.cards c
+                                WHERE c.card_id = inventory.card_id), ''),
+                        set_code
+                    ),
+                    rarity = COALESCE(
+                        NULLIF((SELECT c.rarity FROM catalog_db.cards c
+                                WHERE c.card_id = inventory.card_id), ''),
+                        rarity
+                    ),
+                    image_url = COALESCE(
+                        NULLIF((SELECT c.image_url FROM catalog_db.cards c
+                                WHERE c.card_id = inventory.card_id), ''),
+                        image_url
+                    ),
+                    card_category = COALESCE(
+                        NULLIF((SELECT c.card_category FROM catalog_db.cards c
+                                WHERE c.card_id = inventory.card_id), ''),
+                        card_category
                     )
-                    """
+                WHERE EXISTS (
+                    SELECT 1 FROM catalog_db.cards c
+                    WHERE c.card_id = inventory.card_id
                 )
-                return connection.total_changes - before
-            finally:
-                connection.execute("DETACH DATABASE catalog_db")
+                """
+            )
+            changed = connection.total_changes - before
+            connection.commit()
+            connection.execute("DETACH DATABASE catalog_db")
+            return changed
+        finally:
+            connection.close()
 
     def add_card(self, card: dict[str, Any], quantity: int = 1) -> None:
         quantity = max(1, int(quantity))
