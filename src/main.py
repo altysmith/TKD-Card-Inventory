@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QThread, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from .database import InventoryDatabase
 from .pokemon_api import PokemonTCGClient
+from .search_worker import SearchWorker
 
 
 class MainWindow(QMainWindow):
@@ -36,6 +37,8 @@ class MainWindow(QMainWindow):
         self.api = PokemonTCGClient()
         self.search_results: list[dict] = []
         self.inventory_rows: list[dict] = []
+        self.search_thread: QThread | None = None
+        self.search_worker: SearchWorker | None = None
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_search_tab(), "Find & Add Cards")
@@ -85,9 +88,9 @@ class MainWindow(QMainWindow):
         self.results_table.doubleClicked.connect(self.add_current_card)
         layout.addWidget(self.results_table)
 
-        add_button = QPushButton("Add Selected Cards to Inventory")
-        add_button.clicked.connect(self.add_selected_cards)
-        layout.addWidget(add_button, alignment=Qt.AlignmentFlag.AlignRight)
+        self.add_cards_button = QPushButton("Add Selected Cards to Inventory")
+        self.add_cards_button.clicked.connect(self.add_selected_cards)
+        layout.addWidget(self.add_cards_button, alignment=Qt.AlignmentFlag.AlignRight)
         return page
 
     def _build_inventory_tab(self) -> QWidget:
@@ -152,28 +155,34 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Search", "Enter a card name or collector number.")
             return
 
-        # Clear the old result set immediately so a failed search cannot leave stale cards
-        # available for selection and accidental inventory additions.
+        if self.search_thread is not None and self.search_thread.isRunning():
+            self.statusBar().showMessage("A card search is already running")
+            return
+
         self.search_results = []
         self.results_table.clearContents()
         self.results_table.setRowCount(0)
         self.search_button.setEnabled(False)
+        self.add_cards_button.setEnabled(False)
         self.statusBar().showMessage("Searching the Pokémon card catalog...")
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            results = self.api.search_cards(name, number)
-        except Exception as exc:
-            self.statusBar().showMessage("Search failed")
-            QMessageBox.warning(self, "Search failed", str(exc))
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.search_button.setEnabled(True)
+        self.search_thread = QThread(self)
+        self.search_worker = SearchWorker(self.api, name, number)
+        self.search_worker.moveToThread(self.search_thread)
 
+        self.search_thread.started.connect(self.search_worker.run)
+        self.search_worker.succeeded.connect(self._show_search_results)
+        self.search_worker.failed.connect(self._show_search_error)
+        self.search_worker.finished.connect(self.search_thread.quit)
+        self.search_worker.finished.connect(self.search_worker.deleteLater)
+        self.search_thread.finished.connect(self.search_thread.deleteLater)
+        self.search_thread.finished.connect(self._search_finished)
+        self.search_thread.start()
+
+    def _show_search_results(self, results: list) -> None:
         self.search_results = results
-        self.results_table.setRowCount(len(self.search_results))
-        for row_index, card in enumerate(self.search_results):
+        self.results_table.setRowCount(len(results))
+        for row_index, card in enumerate(results):
             values = [
                 card["name"],
                 card["set_name"],
@@ -184,11 +193,22 @@ class MainWindow(QMainWindow):
             for column, value in enumerate(values):
                 self.results_table.setItem(row_index, column, QTableWidgetItem(str(value)))
         self.results_table.resizeColumnsToContents()
-
-        if self.search_results:
-            self.statusBar().showMessage(f"Found {len(self.search_results)} matching cards")
+        if results:
+            self.statusBar().showMessage(f"Found {len(results)} matching cards")
         else:
             self.statusBar().showMessage("No matching cards found")
+
+    def _show_search_error(self, message: str) -> None:
+        self.search_results = []
+        self.results_table.setRowCount(0)
+        self.statusBar().showMessage("Search failed")
+        QMessageBox.warning(self, "Search failed", message)
+
+    def _search_finished(self) -> None:
+        self.search_button.setEnabled(True)
+        self.add_cards_button.setEnabled(bool(self.search_results))
+        self.search_thread = None
+        self.search_worker = None
 
     def add_current_card(self) -> None:
         row = self.results_table.currentRow()
