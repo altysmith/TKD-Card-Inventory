@@ -64,26 +64,32 @@ class CardOCREngine:
 
     @staticmethod
     def _bottom_left_identifier(area: Any, mode: str) -> Any:
-        """Keep the modern printed set-code and collector-number line."""
+        """Keep only the modern printed set-code and collector-number baseline."""
         height, width = area.shape[:2]
         if mode == "identifier":
-            return area[int(height * 0.42) : int(height * 0.98), 0 : int(width * 0.82)].copy()
+            return area[
+                int(height * 0.52) : int(height * 0.96),
+                int(width * 0.02) : int(width * 0.72),
+            ].copy()
+
+        # Tightened from the previous lower-third crop. This intentionally excludes
+        # most copyright/rules text and keeps the set code plus collector fraction.
         return area[
-            int(height * 0.82) : int(height * 0.985),
-            0 : int(width * 0.68),
+            int(height * 0.875) : int(height * 0.978),
+            int(width * 0.035) : int(width * 0.58),
         ].copy()
 
     @staticmethod
     def _split_identifier(identifier: Any) -> tuple[Any, Any]:
-        """Create overlapping crops because card layouts vary slightly by expansion."""
+        """Create slightly overlapping crops for the code and fraction."""
         height, width = identifier.shape[:2]
-        # The printed three-letter code is at the far left. Keep some overlap so a
-        # slightly shifted card still retains all three letters.
-        code_crop = identifier[0:height, 0 : max(1, int(width * 0.46))].copy()
-        # The collector fraction sits immediately to the right of the code.
+        code_crop = identifier[
+            int(height * 0.05) : int(height * 0.95),
+            0 : max(1, int(width * 0.42)),
+        ].copy()
         number_crop = identifier[
-            0:height,
-            int(width * 0.18) : max(int(width * 0.19), int(width * 0.98)),
+            int(height * 0.05) : int(height * 0.95),
+            int(width * 0.25) : max(int(width * 0.26), int(width * 0.98)),
         ].copy()
         return code_crop, number_crop
 
@@ -91,13 +97,13 @@ class CardOCREngine:
     def _prepare(image: Any, scale: float, threshold: bool = False) -> Any:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         enlarged = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(enlarged)
-        denoised = cv2.bilateralFilter(clahe, 5, 35, 35)
+        clahe = cv2.createCLAHE(clipLimit=2.6, tileGridSize=(8, 8)).apply(enlarged)
+        denoised = cv2.bilateralFilter(clahe, 5, 30, 30)
         sharpened = cv2.addWeighted(
             denoised,
-            2.0,
-            cv2.GaussianBlur(denoised, (0, 0), 1.1),
-            -1.0,
+            1.85,
+            cv2.GaussianBlur(denoised, (0, 0), 1.0),
+            -0.85,
             0,
         )
         if not threshold:
@@ -126,15 +132,12 @@ class CardOCREngine:
     @staticmethod
     def _normalize_code(text: str) -> str:
         normalized = re.sub(r"[^A-Z]", "", text.upper())
-        # Only accept the exact modern three-letter layout. Do not invent a code
-        # from longer words or unrelated copyright text.
         return normalized if len(normalized) == 3 else ""
 
     @staticmethod
     def _normalize_number_text(text: str) -> str:
         normalized = text.upper().replace("|", "/").replace("\\", "/")
         normalized = re.sub(r"\s+", "", normalized)
-        # Corrections are intentionally conservative and only applied in a numeric string.
         normalized = normalized.replace("O", "0").replace("Q", "0")
         normalized = normalized.replace("I", "1").replace("L", "1")
         normalized = normalized.replace("S", "5").replace("B", "8")
@@ -169,17 +172,40 @@ class CardOCREngine:
         return int(round(sum(valid) / len(valid))) if valid else 0
 
     @staticmethod
+    def _text_evidence(texts: list[str], kind: str) -> int:
+        joined = " ".join(texts).upper()
+        if kind == "code":
+            letters = len(re.findall(r"[A-Z]", joined))
+            return min(100, letters * 22)
+        digits = len(re.findall(r"\d", joined))
+        slash_bonus = 25 if "/" in joined or "|" in joined or "\\" in joined else 0
+        return min(100, digits * 10 + slash_bonus)
+
+    @staticmethod
+    def _capture_quality(image: Any, sharpness: float) -> int:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        contrast = float(gray.std())
+        sharp_score = min(100.0, sharpness / 1.25)
+        contrast_score = min(100.0, contrast * 2.1)
+        return int(round((sharp_score * 0.62) + (contrast_score * 0.38)))
+
+    @staticmethod
     def _debug_canvas(left: Any, right: Any) -> Any:
-        """Return a side-by-side image without writing temporary images to disk."""
-        target_height = max(left.shape[0], right.shape[0])
+        """Return labeled-looking bordered crops without writing files to disk."""
+        left_bordered = cv2.copyMakeBorder(left, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=(255, 0, 0))
+        right_bordered = cv2.copyMakeBorder(right, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=(0, 255, 255))
+        target_height = max(left_bordered.shape[0], right_bordered.shape[0])
 
         def pad(image: Any) -> Any:
             if image.shape[0] == target_height:
                 return image
             bottom = target_height - image.shape[0]
-            return cv2.copyMakeBorder(image, 0, bottom, 0, 0, cv2.BORDER_CONSTANT, value=0)
+            value = 0 if len(image.shape) == 2 else (0, 0, 0)
+            return cv2.copyMakeBorder(image, 0, bottom, 0, 0, cv2.BORDER_CONSTANT, value=value)
 
-        return np.hstack((pad(left), pad(right)))
+        gap_shape = (target_height, 18) if len(left_bordered.shape) == 2 else (target_height, 18, 3)
+        gap = np.zeros(gap_shape, dtype=left_bordered.dtype)
+        return np.hstack((pad(left_bordered), gap, pad(right_bordered)))
 
     def read_card(self, frame: Any, mode: str = "full", enhanced: bool = False) -> OCRResult:
         if not self.available():
@@ -194,8 +220,9 @@ class CardOCREngine:
 
         gray_identifier = cv2.cvtColor(identifier, cv2.COLOR_BGR2GRAY)
         sharpness = float(cv2.Laplacian(gray_identifier, cv2.CV_64F).var())
+        capture_quality = self._capture_quality(identifier, sharpness)
 
-        scale = 10.0 if enhanced else 8.0
+        scale = 11.0 if enhanced else 9.0
         code_processed = self._prepare(code_crop, scale, threshold=enhanced)
         number_processed = self._prepare(number_crop, scale, threshold=enhanced)
 
@@ -214,30 +241,53 @@ class CardOCREngine:
         set_code, matched_code_text = self._extract_code(code_attempts)
         collector_number, printed_total, matched_number_text = self._extract_fraction(number_attempts)
 
-        code_conf = 0
+        code_tesseract = 0
         for text, confidences in code_attempts:
             if text == matched_code_text:
-                code_conf = self._average_confidence(confidences)
+                code_tesseract = self._average_confidence(confidences)
                 break
-        number_conf = 0
+        number_tesseract = 0
         for text, confidences in number_attempts:
             if text == matched_number_text:
-                number_conf = self._average_confidence(confidences)
+                number_tesseract = self._average_confidence(confidences)
                 break
 
-        # A complete modern identifier is the strongest result. A collector fraction
-        # alone is still useful for narrowing the local catalog, but should require review.
+        code_texts = [text for text, _ in code_attempts if text]
+        number_texts = [text for text, _ in number_attempts if text]
+        code_evidence = self._text_evidence(code_texts, "code")
+        number_evidence = self._text_evidence(number_texts, "number")
+
+        if set_code:
+            code_score = max(88, code_tesseract)
+        else:
+            code_score = int(round((code_tesseract * 0.45) + (code_evidence * 0.55)))
+
+        if collector_number and printed_total:
+            number_score = max(94, number_tesseract)
+        else:
+            number_score = int(round((number_tesseract * 0.4) + (number_evidence * 0.6)))
+
+        # Graded recognition does not collapse to zero merely because strict parsing failed.
         if set_code and collector_number and printed_total:
             confidence = 99
         elif collector_number and printed_total:
-            confidence = 88
+            confidence = max(82, int(round(number_score * 0.88 + code_score * 0.12)))
         elif set_code:
-            confidence = 55
+            confidence = max(58, int(round(code_score * 0.78 + number_score * 0.22)))
         else:
-            confidence = min(40, max(code_conf, number_conf))
+            confidence = int(round(
+                capture_quality * 0.28 + code_score * 0.30 + number_score * 0.42
+            ))
+            confidence = min(74, confidence)
 
         elapsed = int(round((time.perf_counter() - started) * 1000))
-        raw_lines = ["Set-code attempts:"]
+        raw_lines = [
+            f"Capture quality: {capture_quality}%",
+            f"Set-code evidence: {code_score}%",
+            f"Collector-number evidence: {number_score}%",
+            "Crop borders: blue = set code, yellow = collector fraction",
+            "Set-code attempts:",
+        ]
         raw_lines.extend(f"  {index + 1}: {text or '<nothing>'}" for index, (text, _) in enumerate(code_attempts))
         raw_lines.append("Collector-number attempts:")
         raw_lines.extend(
@@ -248,7 +298,7 @@ class CardOCREngine:
             set_code=set_code,
             collector_number=collector_number,
             printed_total=printed_total,
-            confidence=confidence,
+            confidence=max(0, min(100, confidence)),
             raw_text="\n".join(raw_lines),
             processing_ms=elapsed,
             sharpness=sharpness,
