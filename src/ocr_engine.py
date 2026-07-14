@@ -19,18 +19,21 @@ class OCRResult:
     card_name: str = ""
     set_code: str = ""
     collector_number: str = ""
+    printed_total: int | None = None
     confidence: int = 0
     raw_text: str = ""
 
 
 class CardOCREngine:
-    """Read only the narrow card regions that contain useful identifiers."""
+    """Read narrow card regions and preserve collector-number denominators."""
 
-    NUMBER_PATTERNS = (
-        re.compile(r"\b([A-Z]{0,3}\d{1,3})\s*/\s*\d{1,3}\b", re.IGNORECASE),
-        re.compile(r"\b(SVP|SWSH|SM|XY|BW)\s*[- ]?\s*(\d{1,3})\b", re.IGNORECASE),
-        re.compile(r"\b(TG|GG|RC)(\d{1,3})\b", re.IGNORECASE),
+    STANDARD_NUMBER = re.compile(
+        r"\b([A-Z]{0,3}\d{1,3})\s*[/|]\s*(\d{1,3})\b", re.IGNORECASE
     )
+    PROMO_NUMBER = re.compile(
+        r"\b(SVP|SWSH|SM|XY|BW)\s*[- ]?\s*(\d{1,3})\b", re.IGNORECASE
+    )
+    GALLERY_NUMBER = re.compile(r"\b(TG|GG|RC)\s*(\d{1,3})\b", re.IGNORECASE)
 
     def available(self) -> bool:
         if pytesseract is None:
@@ -59,8 +62,12 @@ class CardOCREngine:
             normalized, 1.8, cv2.GaussianBlur(normalized, (0, 0), 2), -0.8, 0
         )
         adaptive = cv2.adaptiveThreshold(
-            sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 31, 9,
+            sharpened,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            9,
         )
         _, otsu = cv2.threshold(
             sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
@@ -93,24 +100,29 @@ class CardOCREngine:
         text = re.sub(r"\s+", " ", text).strip()
         text = re.sub(
             r"\b(?:BASIC|STAGE\s*[12]|TRAINER|ENERGY|HP\s*\d+)\b",
-            "", text, flags=re.I,
+            "",
+            text,
+            flags=re.I,
         )
         return re.sub(r"\s+", " ", text).strip(" -")
 
-    def _find_number(self, texts: list[str]) -> tuple[str, str, str]:
+    def _find_number(self, texts: list[str]) -> tuple[str, str, int | None, str]:
         for text in texts:
             normalized = text.replace("|", "/")
-            for pattern in self.NUMBER_PATTERNS:
-                match = pattern.search(normalized)
-                if not match:
-                    continue
-                groups = match.groups()
-                if len(groups) == 1:
-                    return "", groups[0].upper(), text
-                if groups[0].upper() in {"SVP", "SWSH", "SM", "XY", "BW"}:
-                    return groups[0].upper(), groups[1], text
-                return "", "".join(groups).upper(), text
-        return "", "", ""
+
+            match = self.STANDARD_NUMBER.search(normalized)
+            if match:
+                return "", match.group(1).upper(), int(match.group(2)), text
+
+            match = self.PROMO_NUMBER.search(normalized)
+            if match:
+                return match.group(1).upper(), match.group(2), None, text
+
+            match = self.GALLERY_NUMBER.search(normalized)
+            if match:
+                return "", f"{match.group(1).upper()}{match.group(2)}", None, text
+
+        return "", "", None, ""
 
     def read_card(self, frame: Any) -> OCRResult:
         if not self.available():
@@ -138,7 +150,7 @@ class CardOCREngine:
             key=lambda item: (sum(item[1]) / len(item[1])) if item[1] else -1,
         )
         bottom_texts = [text for text, _ in bottom_candidates]
-        set_code, collector_number, matched_text = self._find_number(bottom_texts)
+        set_code, collector_number, printed_total, matched_text = self._find_number(bottom_texts)
 
         if matched_text:
             bottom_text, bottom_conf = next(
@@ -162,6 +174,7 @@ class CardOCREngine:
             card_name=card_name,
             set_code=set_code,
             collector_number=collector_number,
+            printed_total=printed_total,
             confidence=max(0, min(100, confidence)),
             raw_text=f"{top_text}\n{bottom_text}".strip(),
         )
