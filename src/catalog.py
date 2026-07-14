@@ -22,6 +22,9 @@ class PokemonCatalog:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
+            # Create the base tables first. Existing catalogs may not yet have the
+            # enriched columns, so indexes that reference those columns must be
+            # created only after the migration below completes.
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS cards (
@@ -34,27 +37,16 @@ class PokemonCatalog:
                     printed_total INTEGER,
                     rarity TEXT,
                     image_url TEXT,
-                    supertype TEXT,
-                    subtypes TEXT,
-                    card_category TEXT,
-                    pokemon_types TEXT,
-                    hp TEXT,
-                    regulation_mark TEXT,
-                    rule_box INTEGER NOT NULL DEFAULT 0,
-                    is_promo INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
-                CREATE INDEX IF NOT EXISTS idx_cards_name ON cards(card_name COLLATE NOCASE);
-                CREATE INDEX IF NOT EXISTS idx_cards_set_code_number
-                    ON cards(set_code COLLATE NOCASE, collector_number_numeric);
-                CREATE INDEX IF NOT EXISTS idx_cards_number ON cards(collector_number_numeric);
-                CREATE INDEX IF NOT EXISTS idx_cards_category ON cards(card_category COLLATE NOCASE);
+
                 CREATE TABLE IF NOT EXISTS catalog_metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
                 """
             )
+
             existing = {row[1] for row in connection.execute("PRAGMA table_info(cards)")}
             additions = {
                 "supertype": "TEXT",
@@ -69,6 +61,20 @@ class PokemonCatalog:
             for name, definition in additions.items():
                 if name not in existing:
                     connection.execute(f"ALTER TABLE cards ADD COLUMN {name} {definition}")
+
+            connection.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_cards_name
+                    ON cards(card_name COLLATE NOCASE);
+                CREATE INDEX IF NOT EXISTS idx_cards_set_code_number
+                    ON cards(set_code COLLATE NOCASE, collector_number_numeric);
+                CREATE INDEX IF NOT EXISTS idx_cards_number
+                    ON cards(collector_number_numeric);
+                CREATE INDEX IF NOT EXISTS idx_cards_category
+                    ON cards(card_category COLLATE NOCASE);
+                """
+            )
+
             connection.execute(
                 """
                 UPDATE cards SET set_code = 'MEW', updated_at = CURRENT_TIMESTAMP
@@ -93,12 +99,22 @@ class PokemonCatalog:
             number_numeric = int(digits) if digits else None
             rows.append(
                 (
-                    card["id"], card.get("name", "Unknown"), card.get("set_name", "Unknown Set"),
-                    card.get("set_code", ""), raw_number, number_numeric, card.get("printed_total"),
-                    card.get("rarity", ""), card.get("image_url", ""), card.get("supertype", ""),
-                    json.dumps(card.get("subtypes", [])), card.get("card_category", ""),
-                    json.dumps(card.get("pokemon_types", [])), card.get("hp", ""),
-                    card.get("regulation_mark", ""), int(bool(card.get("rule_box"))),
+                    card["id"],
+                    card.get("name", "Unknown"),
+                    card.get("set_name", "Unknown Set"),
+                    card.get("set_code", ""),
+                    raw_number,
+                    number_numeric,
+                    card.get("printed_total"),
+                    card.get("rarity", ""),
+                    card.get("image_url", ""),
+                    card.get("supertype", ""),
+                    json.dumps(card.get("subtypes", [])),
+                    card.get("card_category", ""),
+                    json.dumps(card.get("pokemon_types", [])),
+                    card.get("hp", ""),
+                    card.get("regulation_mark", ""),
+                    int(bool(card.get("rule_box"))),
                     int(bool(card.get("is_promo"))),
                 )
             )
@@ -192,13 +208,20 @@ class PokemonCatalog:
         if row["printed_total"]:
             display_number = f"{display_number}/{row['printed_total']}"
         return {
-            "id": row["card_id"], "name": row["card_name"], "number": display_number,
-            "raw_number": row["collector_number"], "rarity": row["rarity"] or "",
-            "set_name": row["set_name"], "set_code": row["set_code"] or "",
-            "image_url": row["image_url"] or "", "supertype": row["supertype"] or "",
+            "id": row["card_id"],
+            "name": row["card_name"],
+            "number": display_number,
+            "raw_number": row["collector_number"],
+            "rarity": row["rarity"] or "",
+            "set_name": row["set_name"],
+            "set_code": row["set_code"] or "",
+            "image_url": row["image_url"] or "",
+            "supertype": row["supertype"] or "",
             "subtypes": json.loads(row["subtypes"] or "[]"),
             "card_category": row["card_category"] or "",
             "pokemon_types": json.loads(row["pokemon_types"] or "[]"),
-            "hp": row["hp"] or "", "regulation_mark": row["regulation_mark"] or "",
-            "rule_box": bool(row["rule_box"]), "is_promo": bool(row["is_promo"]),
+            "hp": row["hp"] or "",
+            "regulation_mark": row["regulation_mark"] or "",
+            "rule_box": bool(row["rule_box"]),
+            "is_promo": bool(row["is_promo"]),
         }
