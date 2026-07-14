@@ -132,16 +132,28 @@ class PokemonTCGClient:
         return cards
 
     def fetch_card_page(self, page: int, page_size: int = 250) -> tuple[list[dict[str, Any]], int]:
-        payload = self._request(
-            {
-                "page": page,
-                "pageSize": page_size,
-                "select": (
-                    "id,name,number,rarity,set,images,supertype,subtypes,types,hp,rules,regulationMark"
-                ),
-            },
-            timeout=(8, 60),
-        )
+        base_params: dict[str, Any] = {
+            "page": page,
+            "pageSize": page_size,
+        }
+        selected_params = {
+            **base_params,
+            "select": (
+                "id,name,number,rarity,set,images,supertype,subtypes,types,hp,rules,regulationMark"
+            ),
+        }
+
+        try:
+            payload = self._request(selected_params, timeout=(8, 60))
+        except RuntimeError as exc:
+            # The API occasionally returns a page-specific HTTP 404 when a select
+            # projection is used, even though the page exists. Retrying the same page
+            # without select asks for the full records and avoids losing enrichment
+            # progress. Other failures are left to the worker's normal retry logic.
+            if "HTTP 404" not in str(exc):
+                raise
+            payload = self._request(base_params, timeout=(8, 90))
+
         cards = [self._parse_card(raw) for raw in payload.get("data", [])]
         total_count = int(payload.get("totalCount") or len(cards))
         return cards, total_count
