@@ -9,7 +9,7 @@ import cv2
 try:
     import pytesseract
     from pytesseract import Output
-except ImportError:  # pragma: no cover - handled at runtime for user setup
+except ImportError:  # pragma: no cover
     pytesseract = None
     Output = None
 
@@ -24,12 +24,7 @@ class OCRResult:
 
 
 class CardOCREngine:
-    """Extract card identifiers without saving scan images to disk.
-
-    All image processing happens in memory. The source frame and derived OCR
-    buffers are wiped after a successful read so only the resulting text and
-    catalog match data remain available to the scanner workflow.
-    """
+    """Read only the narrow card regions that contain useful identifiers."""
 
     NUMBER_PATTERNS = (
         re.compile(r"\b([A-Z]{0,3}\d{1,3})\s*/\s*\d{1,3}\b", re.IGNORECASE),
@@ -48,43 +43,74 @@ class CardOCREngine:
 
     @staticmethod
     def crop_guided_card(frame: Any) -> Any:
-        """Crop the same centered 0.714-ratio card area drawn by the UI guide."""
         height, width = frame.shape[:2]
         guide_height = int(height * 0.82)
-        guide_width = int(guide_height * 0.714)
-        guide_width = min(guide_width, width)
+        guide_width = min(width, int(guide_height * 0.714))
         left = max(0, (width - guide_width) // 2)
         top = max(0, (height - guide_height) // 2)
         return frame[top : top + guide_height, left : left + guide_width].copy()
 
     @staticmethod
-    def _prepare(image: Any, scale: float = 2.5) -> Any:
+    def _variants(image: Any, scale: float) -> list[Any]:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        return cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            31,
-            9,
+        normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        sharpened = cv2.addWeighted(
+            normalized, 1.8, cv2.GaussianBlur(normalized, (0, 0), 2), -0.8, 0
         )
+        adaptive = cv2.adaptiveThreshold(
+            sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, 9,
+        )
+        _, otsu = cv2.threshold(
+            sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        return [sharpened, adaptive, otsu]
+
+    @staticmethod
+    def _read(image: Any, psm: int) -> tuple[str, list[float]]:
+        data = pytesseract.image_to_data(
+            image,
+            output_type=Output.DICT,
+            config=f"--oem 3 --psm {psm}",
+        )
+        words: list[str] = []
+        confidences: list[float] = []
+        for text, confidence in zip(data.get("text", []), data.get("conf", [])):
+            clean = str(text).strip()
+            try:
+                score = float(confidence)
+            except (TypeError, ValueError):
+                score = -1
+            if clean and score >= 0:
+                words.append(clean)
+                confidences.append(score)
+        return " ".join(words), confidences
 
     @staticmethod
     def _clean_name(text: str) -> str:
         text = re.sub(r"[^A-Za-z0-9 .:'\-éÉ♀♂]", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
-        text = re.sub(r"\b(?:BASIC|STAGE\s*[12]|TRAINER|ENERGY|HP\s*\d+)\b", "", text, flags=re.I)
+        text = re.sub(
+            r"\b(?:BASIC|STAGE\s*[12]|TRAINER|ENERGY|HP\s*\d+)\b",
+            "", text, flags=re.I,
+        )
         return re.sub(r"\s+", " ", text).strip(" -")
 
-    @staticmethod
-    def _wipe_image(image: Any) -> None:
-        """Best-effort clearing of an in-memory NumPy/OpenCV image buffer."""
-        try:
-            image.fill(0)
-        except Exception:
-            pass
+    def _find_number(self, texts: list[str]) -> tuple[str, str, str]:
+        for text in texts:
+            normalized = text.replace("|", "/")
+            for pattern in self.NUMBER_PATTERNS:
+                match = pattern.search(normalized)
+                if not match:
+                    continue
+                groups = match.groups()
+                if len(groups) == 1:
+                    return "", groups[0].upper(), text
+                if groups[0].upper() in {"SVP", "SWSH", "SM", "XY", "BW"}:
+                    return groups[0].upper(), groups[1], text
+                return "", "".join(groups).upper(), text
+        return "", "", ""
 
     def read_card(self, frame: Any) -> OCRResult:
         if not self.available():
@@ -94,78 +120,48 @@ class CardOCREngine:
 
         card = self.crop_guided_card(frame)
         height, width = card.shape[:2]
-        top_region = card[0 : max(1, int(height * 0.22)), 0:width]
-        bottom_region = card[int(height * 0.76) : height, 0:width]
+        top_region = card[0 : max(1, int(height * 0.14)), 0:width]
+        bottom_region = card[int(height * 0.82) : int(height * 0.98), 0:width]
 
-        top_prepared = self._prepare(top_region, 3.0)
-        bottom_prepared = self._prepare(bottom_region, 3.5)
+        top_candidates: list[tuple[str, list[float]]] = []
+        for variant in self._variants(top_region, 3.4):
+            top_candidates.append(self._read(variant, 7))
+            top_candidates.append(self._read(variant, 11))
 
-        try:
-            top_data = pytesseract.image_to_data(
-                top_prepared,
-                output_type=Output.DICT,
-                config="--oem 3 --psm 6",
+        bottom_candidates: list[tuple[str, list[float]]] = []
+        for variant in self._variants(bottom_region, 4.2):
+            bottom_candidates.append(self._read(variant, 7))
+            bottom_candidates.append(self._read(variant, 11))
+
+        top_text, top_conf = max(
+            top_candidates,
+            key=lambda item: (sum(item[1]) / len(item[1])) if item[1] else -1,
+        )
+        bottom_texts = [text for text, _ in bottom_candidates]
+        set_code, collector_number, matched_text = self._find_number(bottom_texts)
+
+        if matched_text:
+            bottom_text, bottom_conf = next(
+                ((text, conf) for text, conf in bottom_candidates if text == matched_text),
+                (matched_text, []),
             )
-            bottom_data = pytesseract.image_to_data(
-                bottom_prepared,
-                output_type=Output.DICT,
-                config="--oem 3 --psm 6",
+        else:
+            bottom_text, bottom_conf = max(
+                bottom_candidates,
+                key=lambda item: (sum(item[1]) / len(item[1])) if item[1] else -1,
             )
 
-            def words_and_conf(data: dict[str, Any]) -> tuple[list[str], list[float]]:
-                words: list[str] = []
-                confidences: list[float] = []
-                for text, confidence in zip(data.get("text", []), data.get("conf", [])):
-                    clean = str(text).strip()
-                    try:
-                        score = float(confidence)
-                    except (TypeError, ValueError):
-                        score = -1
-                    if clean and score >= 0:
-                        words.append(clean)
-                        confidences.append(score)
-                return words, confidences
+        card_name = self._clean_name(top_text)
+        if len(card_name.split()) > 4:
+            card_name = " ".join(card_name.split()[:4])
 
-            top_words, top_conf = words_and_conf(top_data)
-            bottom_words, bottom_conf = words_and_conf(bottom_data)
-            top_text = " ".join(top_words)
-            bottom_text = " ".join(bottom_words)
-            raw_text = f"{top_text}\n{bottom_text}".strip()
+        all_conf = [score for score in top_conf + bottom_conf if score >= 0]
+        confidence = int(round(sum(all_conf) / len(all_conf))) if all_conf else 0
 
-            card_name = self._clean_name(top_text)
-            if len(card_name.split()) > 6:
-                card_name = " ".join(card_name.split()[:6])
-
-            set_code = ""
-            collector_number = ""
-            for pattern in self.NUMBER_PATTERNS:
-                match = pattern.search(bottom_text.replace("|", "/"))
-                if not match:
-                    continue
-                groups = match.groups()
-                if len(groups) == 1:
-                    collector_number = groups[0].upper()
-                elif groups[0].upper() in {"SVP", "SWSH", "SM", "XY", "BW"}:
-                    set_code = groups[0].upper()
-                    collector_number = groups[1]
-                else:
-                    collector_number = "".join(groups).upper()
-                break
-
-            all_conf = [score for score in top_conf + bottom_conf if score >= 0]
-            confidence = int(round(sum(all_conf) / len(all_conf))) if all_conf else 0
-
-            return OCRResult(
-                card_name=card_name,
-                set_code=set_code,
-                collector_number=collector_number,
-                confidence=max(0, min(100, confidence)),
-                raw_text=raw_text,
-            )
-        finally:
-            # Scans are temporary working data. Nothing is written to disk, and
-            # these buffers are cleared as soon as OCR has finished using them.
-            self._wipe_image(top_prepared)
-            self._wipe_image(bottom_prepared)
-            self._wipe_image(card)
-            self._wipe_image(frame)
+        return OCRResult(
+            card_name=card_name,
+            set_code=set_code,
+            collector_number=collector_number,
+            confidence=max(0, min(100, confidence)),
+            raw_text=f"{top_text}\n{bottom_text}".strip(),
+        )
