@@ -74,6 +74,21 @@ class InventoryDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def set_quantity(self, card_id: str, quantity: int) -> None:
+        quantity = max(0, int(quantity))
+        with self._connect() as connection:
+            if quantity == 0:
+                connection.execute("DELETE FROM inventory WHERE card_id = ?", (card_id,))
+            else:
+                connection.execute(
+                    """
+                    UPDATE inventory
+                    SET quantity = ?, last_added = CURRENT_TIMESTAMP
+                    WHERE card_id = ?
+                    """,
+                    (quantity, card_id),
+                )
+
     def remove_one(self, card_id: str) -> None:
         with self._connect() as connection:
             row = connection.execute(
