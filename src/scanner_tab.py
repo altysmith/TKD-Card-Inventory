@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 
 from .catalog import PokemonCatalog
 from .database import InventoryDatabase
+from .ocr_engine import CardOCREngine
 
 
 class ScannerTab(QWidget):
@@ -27,6 +28,7 @@ class ScannerTab(QWidget):
         self.database = database
         self.inventory_changed = inventory_changed
         self.settings = settings
+        self.ocr = CardOCREngine()
         self.camera: cv2.VideoCapture | None = None
         self.current_frame = None
         self.captured_frame = None
@@ -43,8 +45,8 @@ class ScannerTab(QWidget):
         heading.setStyleSheet("font-size: 22px; font-weight: 600;")
         root.addWidget(heading)
         note = QLabel(
-            "Place the card inside the guide, capture it, identify the printing, choose quantity, "
-            "and add it to the scan queue. Automatic detection and OCR are the next layer."
+            "Place the card inside the guide and capture it. OCR will read the card name and "
+            "collector information, search the local catalog, and show matches for confirmation."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #888888;")
@@ -65,7 +67,7 @@ class ScannerTab(QWidget):
         buttons = QHBoxLayout()
         self.camera_button = QPushButton("Start Camera")
         self.camera_button.clicked.connect(self.toggle_camera)
-        self.capture_button = QPushButton("Capture Card")
+        self.capture_button = QPushButton("Capture & Read Card")
         self.capture_button.clicked.connect(self.capture_card)
         self.capture_button.setEnabled(False)
         self.resume_button = QPushButton("Resume Live View")
@@ -80,6 +82,10 @@ class ScannerTab(QWidget):
         title = QLabel("Identify captured card")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
         identify.addWidget(title)
+        self.ocr_status = QLabel("OCR has not run yet.")
+        self.ocr_status.setWordWrap(True)
+        self.ocr_status.setStyleSheet("color: #888888;")
+        identify.addWidget(self.ocr_status)
         self.card_name_input = QLineEdit()
         self.card_name_input.setPlaceholderText("Card name, optional")
         self.set_input = QLineEdit()
@@ -166,13 +172,11 @@ class ScannerTab(QWidget):
                 f"Camera {camera_index} could not be opened. Choose another camera in Settings or check camera permissions.",
             )
             return
-
         resolution = str(self.settings.value("scanner/resolution", ""))
         if "x" in resolution:
             width_text, height_text = resolution.split("x", 1)
             camera.set(cv2.CAP_PROP_FRAME_WIDTH, int(width_text))
             camera.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height_text))
-
         self.camera = camera
         self.timer.start(30)
         self.camera_button.setText("Stop Camera")
@@ -214,8 +218,7 @@ class ScannerTab(QWidget):
         left = (pixmap.width() - guide_width) // 2
         top = (pixmap.height() - guide_height) // 2
         painter.drawRoundedRect(left, top, guide_width, guide_height, 12, 12)
-
-        strip_top = top + int(guide_height * 0.82)
+        strip_top = top + int(guide_height * 0.76)
         painter.setPen(QPen(Qt.GlobalColor.yellow, 2))
         painter.drawRect(left, strip_top, guide_width, max(1, top + guide_height - strip_top))
         painter.end()
@@ -230,6 +233,55 @@ class ScannerTab(QWidget):
         self._display_frame(self.captured_frame)
         self.capture_button.setEnabled(False)
         self.resume_button.setEnabled(True)
+        self.run_ocr()
+
+    def run_ocr(self) -> None:
+        if self.captured_frame is None:
+            return
+        self.ocr_status.setText("Reading card text…")
+        try:
+            result = self.ocr.read_card(self.captured_frame)
+        except RuntimeError as exc:
+            self.ocr_status.setText("OCR unavailable. Manual identification still works.")
+            QMessageBox.warning(self, "OCR unavailable", str(exc))
+            return
+        except Exception as exc:
+            self.ocr_status.setText("OCR could not read this capture. Try better lighting or manual entry.")
+            QMessageBox.warning(self, "OCR failed", str(exc))
+            return
+
+        if result.card_name:
+            self.card_name_input.setText(result.card_name)
+        if result.set_code:
+            self.set_input.setText(result.set_code)
+        if result.collector_number:
+            self.number_input.setText(result.collector_number)
+
+        threshold = int(self.settings.value("scanner/confidence", 90))
+        pieces = [f"OCR confidence: {result.confidence}%"]
+        if result.card_name:
+            pieces.append(f"name: {result.card_name}")
+        if result.collector_number:
+            pieces.append(f"number: {result.collector_number}")
+        if result.set_code:
+            pieces.append(f"set: {result.set_code}")
+        self.ocr_status.setText(" • ".join(pieces))
+
+        if result.card_name or result.collector_number or result.set_code:
+            self.find_matches()
+            if result.confidence >= threshold and len(self.matches) == 1:
+                self.matches_table.selectRow(0)
+                self.ocr_status.setText(
+                    self.ocr_status.text() + " • High-confidence single match selected"
+                )
+            elif result.confidence < threshold:
+                self.ocr_status.setText(
+                    self.ocr_status.text() + " • Below threshold; review before adding"
+                )
+        else:
+            self.ocr_status.setText(
+                f"OCR confidence: {result.confidence}% • No usable card identifiers found. Try again or enter details manually."
+            )
 
     def resume_live_view(self) -> None:
         if self.camera is not None and self.camera.isOpened():
@@ -278,6 +330,7 @@ class ScannerTab(QWidget):
         self.matches = []
         self.matches_table.setRowCount(0)
         self.scan_quantity.setValue(1)
+        self.ocr_status.setText("Ready for the next card.")
         self.resume_live_view()
 
     def _refresh_queue(self) -> None:
