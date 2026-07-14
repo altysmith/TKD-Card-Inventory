@@ -38,6 +38,8 @@ class PokemonCatalog:
 
                 CREATE INDEX IF NOT EXISTS idx_cards_name
                     ON cards(card_name COLLATE NOCASE);
+                CREATE INDEX IF NOT EXISTS idx_cards_set_name
+                    ON cards(set_name COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_cards_set_code_number
                     ON cards(set_code COLLATE NOCASE, collector_number_numeric);
                 CREATE INDEX IF NOT EXISTS idx_cards_number
@@ -122,13 +124,26 @@ class PokemonCatalog:
             ).fetchone()
         return str(row["value"]) if row is not None else default
 
-    def search_cards(self, name: str, number: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    def search_cards(
+        self,
+        name: str = "",
+        number: str = "",
+        set_query: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         parameters: list[Any] = []
 
         if name.strip():
             clauses.append("card_name LIKE ? COLLATE NOCASE")
             parameters.append(f"%{name.strip()}%")
+
+        if set_query.strip():
+            clauses.append(
+                "(set_name LIKE ? COLLATE NOCASE OR set_code LIKE ? COLLATE NOCASE)"
+            )
+            set_value = f"%{set_query.strip()}%"
+            parameters.extend([set_value, set_value])
 
         if number.strip():
             raw_number = number.strip().split("/")[0]
@@ -149,10 +164,10 @@ class PokemonCatalog:
                    printed_total, rarity, image_url
             FROM cards
             WHERE {' AND '.join(clauses)}
-            ORDER BY card_name COLLATE NOCASE,
-                     set_name COLLATE NOCASE,
+            ORDER BY set_name COLLATE NOCASE,
                      collector_number_numeric,
-                     collector_number
+                     collector_number,
+                     card_name COLLATE NOCASE
             LIMIT ?
         """
 
