@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -103,12 +104,34 @@ class MainWindow(QMainWindow):
         csv_button.clicked.connect(lambda: self.export_inventory("csv"))
         excel_button = QPushButton("Export Excel")
         excel_button.clicked.connect(lambda: self.export_inventory("xlsx"))
-        remove_button = QPushButton("Remove One")
-        remove_button.clicked.connect(self.remove_selected_card)
-        top.addWidget(remove_button)
         top.addWidget(csv_button)
         top.addWidget(excel_button)
         layout.addLayout(top)
+
+        quantity_controls = QHBoxLayout()
+        quantity_controls.addWidget(QLabel("Selected card quantity:"))
+
+        minus_button = QPushButton("−1")
+        minus_button.clicked.connect(lambda: self.change_selected_quantity(-1))
+        quantity_controls.addWidget(minus_button)
+
+        self.quantity_input = QSpinBox()
+        self.quantity_input.setRange(0, 999999)
+        self.quantity_input.setValue(1)
+        self.quantity_input.setMinimumWidth(100)
+        quantity_controls.addWidget(self.quantity_input)
+
+        plus_button = QPushButton("+1")
+        plus_button.clicked.connect(lambda: self.change_selected_quantity(1))
+        quantity_controls.addWidget(plus_button)
+
+        set_button = QPushButton("Set Quantity")
+        set_button.clicked.connect(self.set_selected_quantity)
+        quantity_controls.addWidget(set_button)
+
+        quantity_controls.addStretch()
+        quantity_controls.addWidget(QLabel("Setting quantity to 0 removes the card."))
+        layout.addLayout(quantity_controls)
 
         self.inventory_table = QTableWidget(0, 7)
         self.inventory_table.setHorizontalHeaderLabels(
@@ -118,6 +141,7 @@ class MainWindow(QMainWindow):
         self.inventory_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.inventory_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.inventory_table.horizontalHeader().setStretchLastSection(True)
+        self.inventory_table.itemSelectionChanged.connect(self._sync_quantity_control)
         layout.addWidget(self.inventory_table)
         return page
 
@@ -190,8 +214,15 @@ class MainWindow(QMainWindow):
             )
 
     def refresh_inventory(self) -> None:
+        selected_card_id = None
+        current_row = self.inventory_table.currentRow() if hasattr(self, "inventory_table") else -1
+        if 0 <= current_row < len(self.inventory_rows):
+            selected_card_id = self.inventory_rows[current_row]["card_id"]
+
         self.inventory_rows = self.database.list_inventory()
         self.inventory_table.setRowCount(len(self.inventory_rows))
+        row_to_reselect = -1
+
         for row_index, card in enumerate(self.inventory_rows):
             values = [
                 card["card_name"],
@@ -207,15 +238,52 @@ class MainWindow(QMainWindow):
                 if column == 5:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.inventory_table.setItem(row_index, column, item)
-        self.inventory_table.resizeColumnsToContents()
+            if card["card_id"] == selected_card_id:
+                row_to_reselect = row_index
 
-    def remove_selected_card(self) -> None:
+        self.inventory_table.resizeColumnsToContents()
+        if row_to_reselect >= 0:
+            self.inventory_table.selectRow(row_to_reselect)
+        elif self.inventory_rows:
+            self.inventory_table.selectRow(0)
+        else:
+            self.quantity_input.setValue(0)
+
+    def _selected_inventory_row(self) -> int:
         row = self.inventory_table.currentRow()
         if row < 0 or row >= len(self.inventory_rows):
-            QMessageBox.information(self, "Remove card", "Select an inventory row first.")
+            QMessageBox.information(self, "Quantity", "Select an inventory row first.")
+            return -1
+        return row
+
+    def _sync_quantity_control(self) -> None:
+        row = self.inventory_table.currentRow()
+        if 0 <= row < len(self.inventory_rows):
+            self.quantity_input.setValue(int(self.inventory_rows[row]["quantity"]))
+
+    def change_selected_quantity(self, change: int) -> None:
+        row = self._selected_inventory_row()
+        if row < 0:
             return
-        self.database.remove_one(self.inventory_rows[row]["card_id"])
+        card = self.inventory_rows[row]
+        new_quantity = max(0, int(card["quantity"]) + change)
+        self.database.set_quantity(card["card_id"], new_quantity)
         self.refresh_inventory()
+        self.statusBar().showMessage(
+            f"Updated {card['card_name']} quantity to {new_quantity}"
+        )
+
+    def set_selected_quantity(self) -> None:
+        row = self._selected_inventory_row()
+        if row < 0:
+            return
+        card = self.inventory_rows[row]
+        new_quantity = self.quantity_input.value()
+        self.database.set_quantity(card["card_id"], new_quantity)
+        self.refresh_inventory()
+        self.statusBar().showMessage(
+            f"Updated {card['card_name']} quantity to {new_quantity}"
+        )
 
     def export_inventory(self, file_type: str) -> None:
         rows = self.database.list_inventory()
