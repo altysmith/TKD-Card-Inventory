@@ -38,16 +38,17 @@ class InventoryDatabase:
                 """
             )
 
-    def add_card(self, card: dict[str, Any]) -> None:
+    def add_card(self, card: dict[str, Any], quantity: int = 1) -> None:
+        quantity = max(1, int(quantity))
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO inventory (
                     card_id, card_name, set_name, set_code,
                     collector_number, rarity, image_url, quantity
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(card_id) DO UPDATE SET
-                    quantity = quantity + 1,
+                    quantity = quantity + excluded.quantity,
                     last_added = CURRENT_TIMESTAMP
                 """,
                 (
@@ -58,6 +59,7 @@ class InventoryDatabase:
                     card["number"],
                     card.get("rarity", ""),
                     card.get("image_url", ""),
+                    quantity,
                 ),
             )
 
