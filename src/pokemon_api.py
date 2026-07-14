@@ -9,6 +9,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# Some special expansions do not consistently provide the familiar three-letter
+# abbreviation in the API's ptcgoCode field. Keep these aliases centralized so
+# inventory, search, OCR, and exports all use the expected public set code.
+SET_CODE_ALIASES = {
+    "sv3pt5": "MEW",  # Scarlet & Violet—151
+}
+
+
 class PokemonTCGClient:
     BASE_URL = "https://api.pokemontcg.io/v2/cards"
 
@@ -58,6 +66,10 @@ class PokemonTCGClient:
         if printed_total:
             display_number = f"{display_number}/{printed_total}"
 
+        internal_set_id = str(card_set.get("id", ""))
+        set_code = card_set.get("ptcgoCode") or internal_set_id
+        set_code = SET_CODE_ALIASES.get(str(set_code).casefold(), set_code)
+
         return {
             "id": raw["id"],
             "name": raw.get("name", "Unknown"),
@@ -66,7 +78,7 @@ class PokemonTCGClient:
             "printed_total": printed_total,
             "rarity": raw.get("rarity", ""),
             "set_name": card_set.get("name", "Unknown Set"),
-            "set_code": card_set.get("ptcgoCode") or card_set.get("id", ""),
+            "set_code": set_code,
             "image_url": images.get("small") or images.get("large", ""),
         }
 
