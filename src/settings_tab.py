@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 
 
 class SettingsTab(QWidget):
-    """Persistent application settings for the version 0.3 scanner foundation."""
+    """Persistent scanner and export settings."""
 
     settings_changed = Signal()
 
@@ -40,8 +40,8 @@ class SettingsTab(QWidget):
         root.addWidget(heading)
 
         note = QLabel(
-            "Choose the camera and export location used by this computer. "
-            "Scanner confidence is saved now and will control automatic recognition as OCR is added."
+            "Camera source, resolution, orientation, scanner mode, confidence, and export location "
+            "are stored separately on each computer. Saving camera changes stops the active camera."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #888888;")
@@ -61,10 +61,26 @@ class SettingsTab(QWidget):
 
         self.resolution_combo = QComboBox()
         self.resolution_combo.addItem("Default", "")
-        self.resolution_combo.addItem("1280 × 720", "1280x720")
         self.resolution_combo.addItem("1920 × 1080", "1920x1080")
+        self.resolution_combo.addItem("1280 × 720", "1280x720")
         self.resolution_combo.addItem("640 × 480", "640x480")
         form.addRow("Camera resolution:", self.resolution_combo)
+
+        self.orientation_combo = QComboBox()
+        self.orientation_combo.addItem("Automatic", "auto")
+        self.orientation_combo.addItem("Landscape", "landscape")
+        self.orientation_combo.addItem("Portrait — rotate clockwise", "cw")
+        self.orientation_combo.addItem("Portrait — rotate counterclockwise", "ccw")
+        self.orientation_combo.addItem("Upside down", "180")
+        form.addRow("Camera orientation:", self.orientation_combo)
+
+        self.scan_mode_combo = QComboBox()
+        self.scan_mode_combo.addItem("Full card", "full")
+        self.scan_mode_combo.addItem("Identifier close-up", "identifier")
+        self.scan_mode_combo.setToolTip(
+            "Identifier close-up enlarges the lower card area so set codes and collector numbers use more pixels."
+        )
+        form.addRow("Scanner mode:", self.scan_mode_combo)
 
         export_row = QHBoxLayout()
         self.export_input = QLineEdit()
@@ -83,7 +99,7 @@ class SettingsTab(QWidget):
         self.confidence_input.setSuffix("%")
         self.confidence_input.setValue(90)
         self.confidence_input.setToolTip(
-            "Automatic scans will require at least this confidence before being accepted."
+            "Automatic scans require at least this recognition confidence before being accepted."
         )
         form.addRow("Auto-scan confidence:", self.confidence_input)
 
@@ -113,10 +129,6 @@ class SettingsTab(QWidget):
         current = int(self.settings.value("scanner/camera_index", 0))
         found: list[int] = []
         self.detect_button.setEnabled(False)
-
-        # AVFoundation reports the valid device range directly and prints noisy errors
-        # for every out-of-range index. Most Macs expose only indexes 0 and 1, so avoid
-        # probing six nonexistent cameras. Other platforms retain a broader search.
         max_indexes = 2 if sys.platform == "darwin" else 6
         try:
             for index in range(max_indexes):
@@ -158,8 +170,16 @@ class SettingsTab(QWidget):
         self.camera_combo.addItem(f"Camera {camera_index}", camera_index)
 
         resolution = str(self.settings.value("scanner/resolution", ""))
-        resolution_index = self.resolution_combo.findData(resolution)
-        self.resolution_combo.setCurrentIndex(resolution_index if resolution_index >= 0 else 0)
+        index = self.resolution_combo.findData(resolution)
+        self.resolution_combo.setCurrentIndex(index if index >= 0 else 0)
+
+        orientation = str(self.settings.value("scanner/orientation", "auto"))
+        index = self.orientation_combo.findData(orientation)
+        self.orientation_combo.setCurrentIndex(index if index >= 0 else 0)
+
+        scan_mode = str(self.settings.value("scanner/mode", "full"))
+        index = self.scan_mode_combo.findData(scan_mode)
+        self.scan_mode_combo.setCurrentIndex(index if index >= 0 else 0)
 
         self.export_input.setText(str(self.settings.value("exports/default_folder", "")))
         self.confidence_input.setValue(int(self.settings.value("scanner/confidence", 90)))
@@ -168,12 +188,17 @@ class SettingsTab(QWidget):
         )
 
     def save_settings(self) -> None:
-        camera_index = self.camera_combo.currentData()
-        self.settings.setValue("scanner/camera_index", int(camera_index or 0))
+        self.settings.setValue("scanner/camera_index", int(self.camera_combo.currentData() or 0))
         self.settings.setValue("scanner/resolution", self.resolution_combo.currentData() or "")
+        self.settings.setValue("scanner/orientation", self.orientation_combo.currentData() or "auto")
+        self.settings.setValue("scanner/mode", self.scan_mode_combo.currentData() or "full")
         self.settings.setValue("exports/default_folder", self.export_input.text().strip())
         self.settings.setValue("scanner/confidence", self.confidence_input.value())
         self.settings.setValue("scanner/beep", self.beep_checkbox.isChecked())
         self.settings.sync()
         self.settings_changed.emit()
-        QMessageBox.information(self, "Settings saved", "Your scanner and export settings were saved.")
+        QMessageBox.information(
+            self,
+            "Settings saved",
+            "Settings were saved. Any active camera was stopped so the new camera configuration can be applied safely.",
+        )
