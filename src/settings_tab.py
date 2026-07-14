@@ -6,18 +6,8 @@ from pathlib import Path
 import cv2
 from PySide6.QtCore import QSettings, Signal
 from PySide6.QtWidgets import (
-    QCheckBox,
-    QComboBox,
-    QFileDialog,
-    QFormLayout,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMessageBox,
-    QPushButton,
-    QSpinBox,
-    QVBoxLayout,
-    QWidget,
+    QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 
@@ -34,7 +24,6 @@ class SettingsTab(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-
         heading = QLabel("Settings")
         heading.setStyleSheet("font-size: 22px; font-weight: 600;")
         root.addWidget(heading)
@@ -48,7 +37,6 @@ class SettingsTab(QWidget):
         root.addWidget(note)
 
         form = QFormLayout()
-
         camera_row = QHBoxLayout()
         self.camera_combo = QComboBox()
         self.camera_combo.setMinimumWidth(260)
@@ -67,11 +55,13 @@ class SettingsTab(QWidget):
         form.addRow("Camera resolution:", self.resolution_combo)
 
         self.orientation_combo = QComboBox()
-        self.orientation_combo.addItem("Automatic", "auto")
-        self.orientation_combo.addItem("Landscape", "landscape")
+        self.orientation_combo.addItem("Landscape / no rotation", "landscape")
         self.orientation_combo.addItem("Portrait — rotate clockwise", "cw")
         self.orientation_combo.addItem("Portrait — rotate counterclockwise", "ccw")
         self.orientation_combo.addItem("Upside down", "180")
+        self.orientation_combo.setToolTip(
+            "Use a manual orientation. Webcam drivers usually report a landscape frame even when the camera is mounted sideways."
+        )
         form.addRow("Camera orientation:", self.orientation_combo)
 
         self.scan_mode_combo = QComboBox()
@@ -81,6 +71,10 @@ class SettingsTab(QWidget):
             "Identifier close-up enlarges the lower card area so set codes and collector numbers use more pixels."
         )
         form.addRow("Scanner mode:", self.scan_mode_combo)
+
+        self.debug_checkbox = QCheckBox("Show OCR crop, processed image, raw text, timing, and sharpness")
+        self.debug_checkbox.setChecked(True)
+        form.addRow("OCR debug mode:", self.debug_checkbox)
 
         export_row = QHBoxLayout()
         self.export_input = QLineEdit()
@@ -98,15 +92,11 @@ class SettingsTab(QWidget):
         self.confidence_input.setRange(50, 100)
         self.confidence_input.setSuffix("%")
         self.confidence_input.setValue(90)
-        self.confidence_input.setToolTip(
-            "Automatic scans require at least this recognition confidence before being accepted."
-        )
         form.addRow("Auto-scan confidence:", self.confidence_input)
 
         self.beep_checkbox = QCheckBox("Play a confirmation sound after a successful scan")
         self.beep_checkbox.setChecked(True)
         form.addRow("Scanner sound:", self.beep_checkbox)
-
         root.addLayout(form)
 
         buttons = QHBoxLayout()
@@ -147,12 +137,10 @@ class SettingsTab(QWidget):
         if not found:
             self.camera_combo.addItem("Camera 0 (not currently available)", 0)
             QMessageBox.warning(
-                self,
-                "No cameras detected",
+                self, "No cameras detected",
                 "No available cameras were found. Check permissions and make sure another app is not using the camera.",
             )
             return
-
         for index in found:
             self.camera_combo.addItem(f"Camera {index}", index)
         selected = self.camera_combo.findData(current)
@@ -173,7 +161,9 @@ class SettingsTab(QWidget):
         index = self.resolution_combo.findData(resolution)
         self.resolution_combo.setCurrentIndex(index if index >= 0 else 0)
 
-        orientation = str(self.settings.value("scanner/orientation", "auto"))
+        orientation = str(self.settings.value("scanner/orientation", "landscape"))
+        if orientation == "auto":
+            orientation = "landscape"
         index = self.orientation_combo.findData(orientation)
         self.orientation_combo.setCurrentIndex(index if index >= 0 else 0)
 
@@ -181,6 +171,9 @@ class SettingsTab(QWidget):
         index = self.scan_mode_combo.findData(scan_mode)
         self.scan_mode_combo.setCurrentIndex(index if index >= 0 else 0)
 
+        self.debug_checkbox.setChecked(
+            str(self.settings.value("scanner/debug", "true")).casefold() in {"1", "true", "yes"}
+        )
         self.export_input.setText(str(self.settings.value("exports/default_folder", "")))
         self.confidence_input.setValue(int(self.settings.value("scanner/confidence", 90)))
         self.beep_checkbox.setChecked(
@@ -190,15 +183,15 @@ class SettingsTab(QWidget):
     def save_settings(self) -> None:
         self.settings.setValue("scanner/camera_index", int(self.camera_combo.currentData() or 0))
         self.settings.setValue("scanner/resolution", self.resolution_combo.currentData() or "")
-        self.settings.setValue("scanner/orientation", self.orientation_combo.currentData() or "auto")
+        self.settings.setValue("scanner/orientation", self.orientation_combo.currentData() or "landscape")
         self.settings.setValue("scanner/mode", self.scan_mode_combo.currentData() or "full")
+        self.settings.setValue("scanner/debug", self.debug_checkbox.isChecked())
         self.settings.setValue("exports/default_folder", self.export_input.text().strip())
         self.settings.setValue("scanner/confidence", self.confidence_input.value())
         self.settings.setValue("scanner/beep", self.beep_checkbox.isChecked())
         self.settings.sync()
         self.settings_changed.emit()
         QMessageBox.information(
-            self,
-            "Settings saved",
+            self, "Settings saved",
             "Settings were saved. Any active camera was stopped so the new camera configuration can be applied safely.",
         )
