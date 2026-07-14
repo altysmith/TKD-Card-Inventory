@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import cv2
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox,
@@ -20,11 +20,13 @@ class ScannerTab(QWidget):
         catalog: PokemonCatalog,
         database: InventoryDatabase,
         inventory_changed: Callable[[], None],
+        settings: QSettings,
     ) -> None:
         super().__init__()
         self.catalog = catalog
         self.database = database
         self.inventory_changed = inventory_changed
+        self.settings = settings
         self.camera: cv2.VideoCapture | None = None
         self.current_frame = None
         self.captured_frame = None
@@ -33,6 +35,7 @@ class ScannerTab(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._read_camera_frame)
         self._build_ui()
+        self.refresh_settings_display()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -41,11 +44,15 @@ class ScannerTab(QWidget):
         root.addWidget(heading)
         note = QLabel(
             "Place the card inside the guide, capture it, identify the printing, choose quantity, "
-            "and add it to the scan queue. Automatic OCR is the next layer."
+            "and add it to the scan queue. Automatic detection and OCR are the next layer."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #888888;")
         root.addWidget(note)
+
+        self.settings_status = QLabel()
+        self.settings_status.setStyleSheet("color: #888888;")
+        root.addWidget(self.settings_status)
 
         body = QHBoxLayout()
         root.addLayout(body, 2)
@@ -134,6 +141,14 @@ class ScannerTab(QWidget):
         controls.addWidget(commit)
         root.addLayout(controls)
 
+    def refresh_settings_display(self) -> None:
+        camera_index = int(self.settings.value("scanner/camera_index", 0))
+        confidence = int(self.settings.value("scanner/confidence", 90))
+        resolution = str(self.settings.value("scanner/resolution", "")) or "camera default"
+        self.settings_status.setText(
+            f"Camera {camera_index} • Resolution: {resolution} • Auto-scan threshold: {confidence}%"
+        )
+
     def toggle_camera(self) -> None:
         if self.camera is not None and self.camera.isOpened():
             self.stop_camera()
@@ -141,15 +156,28 @@ class ScannerTab(QWidget):
             self.start_camera()
 
     def start_camera(self) -> None:
-        camera = cv2.VideoCapture(0)
+        camera_index = int(self.settings.value("scanner/camera_index", 0))
+        camera = cv2.VideoCapture(camera_index)
         if not camera.isOpened():
             camera.release()
-            QMessageBox.warning(self, "Camera unavailable", "The default webcam could not be opened.")
+            QMessageBox.warning(
+                self,
+                "Camera unavailable",
+                f"Camera {camera_index} could not be opened. Choose another camera in Settings or check camera permissions.",
+            )
             return
+
+        resolution = str(self.settings.value("scanner/resolution", ""))
+        if "x" in resolution:
+            width_text, height_text = resolution.split("x", 1)
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, int(width_text))
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height_text))
+
         self.camera = camera
         self.timer.start(30)
         self.camera_button.setText("Stop Camera")
         self.capture_button.setEnabled(True)
+        self.refresh_settings_display()
 
     def stop_camera(self) -> None:
         self.timer.stop()
@@ -186,6 +214,10 @@ class ScannerTab(QWidget):
         left = (pixmap.width() - guide_width) // 2
         top = (pixmap.height() - guide_height) // 2
         painter.drawRoundedRect(left, top, guide_width, guide_height, 12, 12)
+
+        strip_top = top + int(guide_height * 0.82)
+        painter.setPen(QPen(Qt.GlobalColor.yellow, 2))
+        painter.drawRect(left, strip_top, guide_width, max(1, top + guide_height - strip_top))
         painter.end()
         self.preview.setPixmap(pixmap)
 
