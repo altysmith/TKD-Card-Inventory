@@ -31,12 +31,16 @@ class InventoryDatabase:
                     collector_number TEXT NOT NULL,
                     rarity TEXT,
                     image_url TEXT,
+                    card_category TEXT,
                     quantity INTEGER NOT NULL DEFAULT 1,
                     first_added TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     last_added TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            existing = {row[1] for row in connection.execute("PRAGMA table_info(inventory)")}
+            if "card_category" not in existing:
+                connection.execute("ALTER TABLE inventory ADD COLUMN card_category TEXT")
 
     def add_card(self, card: dict[str, Any], quantity: int = 1) -> None:
         quantity = max(1, int(quantity))
@@ -45,21 +49,20 @@ class InventoryDatabase:
                 """
                 INSERT INTO inventory (
                     card_id, card_name, set_name, set_code,
-                    collector_number, rarity, image_url, quantity
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    collector_number, rarity, image_url, card_category, quantity
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(card_id) DO UPDATE SET
                     quantity = quantity + excluded.quantity,
+                    card_category = CASE
+                        WHEN excluded.card_category <> '' THEN excluded.card_category
+                        ELSE inventory.card_category
+                    END,
                     last_added = CURRENT_TIMESTAMP
                 """,
                 (
-                    card["id"],
-                    card["name"],
-                    card["set_name"],
-                    card.get("set_code", ""),
-                    card["number"],
-                    card.get("rarity", ""),
-                    card.get("image_url", ""),
-                    quantity,
+                    card["id"], card["name"], card["set_name"], card.get("set_code", ""),
+                    card["number"], card.get("rarity", ""), card.get("image_url", ""),
+                    card.get("card_category", ""), quantity,
                 ),
             )
 
@@ -67,9 +70,8 @@ class InventoryDatabase:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT card_id, card_name, set_name, set_code,
-                       collector_number, rarity, quantity,
-                       first_added, last_added
+                SELECT card_id, card_name, set_name, set_code, collector_number,
+                       rarity, card_category, quantity, first_added, last_added
                 FROM inventory
                 ORDER BY card_name COLLATE NOCASE, set_name, collector_number
                 """
@@ -83,11 +85,7 @@ class InventoryDatabase:
                 connection.execute("DELETE FROM inventory WHERE card_id = ?", (card_id,))
             else:
                 connection.execute(
-                    """
-                    UPDATE inventory
-                    SET quantity = ?, last_added = CURRENT_TIMESTAMP
-                    WHERE card_id = ?
-                    """,
+                    "UPDATE inventory SET quantity = ?, last_added = CURRENT_TIMESTAMP WHERE card_id = ?",
                     (quantity, card_id),
                 )
 
