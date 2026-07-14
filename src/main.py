@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-from PySide6.QtCore import QThread, Qt, QTimer
+from PySide6.QtCore import QSettings, QThread, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -18,6 +18,7 @@ from .catalog_worker import CatalogDownloadWorker
 from .database import InventoryDatabase
 from .pokemon_api import PokemonTCGClient
 from .scanner_tab import ScannerTab
+from .settings_tab import SettingsTab
 
 
 class NaturalSortItem(QTableWidgetItem):
@@ -32,6 +33,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("TKD Card Inventory")
         self.resize(1300, 820)
+        self.settings = QSettings()
         self.database = InventoryDatabase()
         self.catalog = PokemonCatalog()
         self.api = PokemonTCGClient()
@@ -41,10 +43,15 @@ class MainWindow(QMainWindow):
         self.catalog_worker: CatalogDownloadWorker | None = None
 
         self.tabs = QTabWidget()
-        self.scanner_tab = ScannerTab(self.catalog, self.database, self.refresh_inventory)
+        self.scanner_tab = ScannerTab(
+            self.catalog, self.database, self.refresh_inventory, self.settings
+        )
+        self.settings_tab = SettingsTab(self.settings)
+        self.settings_tab.settings_changed.connect(self.scanner_tab.refresh_settings_display)
         self.tabs.addTab(self.scanner_tab, "Scanner")
         self.tabs.addTab(self._build_search_tab(), "Find & Add Cards")
         self.tabs.addTab(self._build_inventory_tab(), "Inventory")
+        self.tabs.addTab(self.settings_tab, "Settings")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(self.tabs)
 
@@ -322,11 +329,17 @@ class MainWindow(QMainWindow):
         if not rows:
             QMessageBox.information(self, "Export", "There is no inventory to export yet.")
             return
-        suggested = f"TKD_Card_Inventory.{file_type}"
+
+        suggested_name = f"TKD_Card_Inventory.{file_type}"
+        export_folder = str(self.settings.value("exports/default_folder", "")).strip()
+        suggested_path = str(Path(export_folder) / suggested_name) if export_folder else suggested_name
         file_filter = "CSV Files (*.csv)" if file_type == "csv" else "Excel Files (*.xlsx)"
-        filename, _ = QFileDialog.getSaveFileName(self, "Export inventory", suggested, file_filter)
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export inventory", suggested_path, file_filter
+        )
         if not filename:
             return
+
         path = Path(filename)
         frame = pd.DataFrame(rows)
         if file_type == "csv":
@@ -338,6 +351,10 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, index: int) -> None:
         if index == 2:
             self.refresh_inventory()
+        elif index == 0:
+            self.scanner_tab.refresh_settings_display()
+        elif index == 3:
+            self.settings_tab.load_settings()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.scanner_tab.shutdown()
