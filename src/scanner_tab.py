@@ -6,25 +6,17 @@ import cv2
 from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMessageBox,
-    QPushButton,
-    QSpinBox,
-    QTableWidget,
-    QTableWidgetItem,
-    QVBoxLayout,
-    QWidget,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+    QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .catalog import PokemonCatalog
 from .database import InventoryDatabase
-from .ocr_engine import CardOCREngine
+from .ocr_engine import CardOCREngine, OCRResult
 
 
 class ScannerTab(QWidget):
-    """Camera scanner using temporary in-memory still frames."""
+    """Camera scanner with temporary OCR debug previews."""
 
     CARD_ASPECT_RATIO = 0.714
 
@@ -68,9 +60,8 @@ class ScannerTab(QWidget):
         root.addWidget(heading)
 
         note = QLabel(
-            "Use Full Card mode for general recognition or Identifier Close-Up mode to make the "
-            "printed set code and collector number much larger. The app waits for focus, samples "
-            "several temporary frames, and sends only the sharpest one to OCR."
+            "The fast OCR pass now uses two targeted reads. Enable OCR Debug Mode in Settings to see "
+            "the exact crop, processed image, raw text, sharpness, and processing time."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #888888;")
@@ -79,7 +70,6 @@ class ScannerTab(QWidget):
         self.settings_status = QLabel()
         self.settings_status.setStyleSheet("color: #888888;")
         root.addWidget(self.settings_status)
-
         self.placement_status = QLabel("Start the camera, then calibrate with the guide empty.")
         self.placement_status.setWordWrap(True)
         self.placement_status.setStyleSheet("color: #aaaaaa;")
@@ -158,6 +148,31 @@ class ScannerTab(QWidget):
         identify.addWidget(queue_button)
         body.addLayout(identify, 2)
 
+        self.debug_group = QGroupBox("OCR Debug — what the app actually read")
+        debug_layout = QVBoxLayout(self.debug_group)
+        debug_images = QHBoxLayout()
+        self.debug_crop = QLabel("OCR crop")
+        self.debug_processed = QLabel("Processed OCR image")
+        for label in (self.debug_crop, self.debug_processed):
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setMinimumSize(300, 150)
+            label.setStyleSheet("border: 1px solid #555; background: #111;")
+            debug_images.addWidget(label)
+        debug_layout.addLayout(debug_images)
+        self.debug_metrics = QLabel("No debug data yet.")
+        self.debug_metrics.setWordWrap(True)
+        debug_layout.addWidget(self.debug_metrics)
+        self.debug_text = QPlainTextEdit()
+        self.debug_text.setReadOnly(True)
+        self.debug_text.setPlaceholderText("Raw OCR output will appear here.")
+        self.debug_text.setMaximumHeight(100)
+        debug_layout.addWidget(self.debug_text)
+        self.enhanced_button = QPushButton("Retry Enhanced OCR on This Capture")
+        self.enhanced_button.clicked.connect(self.retry_enhanced_ocr)
+        self.enhanced_button.setEnabled(False)
+        debug_layout.addWidget(self.enhanced_button, alignment=Qt.AlignmentFlag.AlignRight)
+        root.addWidget(self.debug_group)
+
         queue_heading = QLabel("Scan queue")
         queue_heading.setStyleSheet("font-size: 18px; font-weight: 600;")
         root.addWidget(queue_heading)
@@ -188,7 +203,7 @@ class ScannerTab(QWidget):
         return (
             int(self.settings.value("scanner/camera_index", 0)),
             str(self.settings.value("scanner/resolution", "")),
-            str(self.settings.value("scanner/orientation", "auto")),
+            str(self.settings.value("scanner/orientation", "landscape")),
             str(self.settings.value("scanner/mode", "full")),
         )
 
@@ -209,6 +224,8 @@ class ScannerTab(QWidget):
             f"Camera {camera_index} • Requested: {resolution}{actual} • Orientation: {orientation} "
             f"• Mode: {mode} • Threshold: {confidence}%"
         )
+        debug_enabled = str(self.settings.value("scanner/debug", "true")).casefold() in {"1", "true", "yes"}
+        self.debug_group.setVisible(debug_enabled)
 
     def toggle_camera(self) -> None:
         if self.camera is not None and self.camera.isOpened():
@@ -224,8 +241,6 @@ class ScannerTab(QWidget):
             return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
         if orientation == "180":
             return cv2.rotate(frame, cv2.ROTATE_180)
-        if orientation == "auto" and frame.shape[1] < frame.shape[0]:
-            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         return frame
 
     def start_camera(self) -> None:
@@ -234,8 +249,7 @@ class ScannerTab(QWidget):
         if not camera.isOpened():
             camera.release()
             QMessageBox.warning(
-                self,
-                "Camera unavailable",
+                self, "Camera unavailable",
                 f"Camera {camera_index} could not be opened. Choose another camera in Settings or check permissions.",
             )
             return
@@ -264,6 +278,7 @@ class ScannerTab(QWidget):
         self.capture_button.setEnabled(False)
         self.reset_button.setEnabled(False)
         self.resume_button.setEnabled(False)
+        self.enhanced_button.setEnabled(False)
         self.preview.setPixmap(QPixmap())
         self.preview.setText("Camera is off")
 
@@ -278,9 +293,7 @@ class ScannerTab(QWidget):
             if guide_width > int(width * 0.92):
                 guide_width = int(width * 0.92)
                 guide_height = int(guide_width / self.CARD_ASPECT_RATIO)
-        left = max(0, (width - guide_width) // 2)
-        top = max(0, (height - guide_height) // 2)
-        return left, top, guide_width, guide_height
+        return max(0, (width - guide_width) // 2), max(0, (height - guide_height) // 2), guide_width, guide_height
 
     def _guide_crop(self, frame):
         height, width = frame.shape[:2]
@@ -300,6 +313,8 @@ class ScannerTab(QWidget):
         self._stable_frames = 0
         self._capture_pending = False
         self._armed = False
+        self.captured_frame = None
+        self.enhanced_button.setEnabled(False)
         if self.camera is not None and self.camera.isOpened():
             if not self.timer.isActive():
                 self.timer.start(30)
@@ -313,7 +328,7 @@ class ScannerTab(QWidget):
         ok, frame = self.camera.read()
         if not ok:
             return
-        orientation = str(self.settings.value("scanner/orientation", "auto"))
+        orientation = str(self.settings.value("scanner/orientation", "landscape"))
         frame = self._rotate_frame(frame, orientation)
         self.current_frame = frame
         self._display_frame(frame)
@@ -328,9 +343,7 @@ class ScannerTab(QWidget):
             motion = float(cv2.absdiff(current, self._previous_gray).mean())
             self._previous_gray = current
             self._baseline_frames = self._baseline_frames + 1 if motion <= 3.2 else 0
-            self.placement_status.setText(
-                f"Calibrating empty guide… {min(100, self._baseline_frames * 12)}%"
-            )
+            self.placement_status.setText(f"Calibrating empty guide… {min(100, self._baseline_frames * 12)}%")
             if self._baseline_frames >= 8:
                 self._baseline_gray = current.copy()
                 self._armed = True
@@ -340,12 +353,9 @@ class ScannerTab(QWidget):
         change = cv2.absdiff(current, self._baseline_gray)
         changed_ratio = float((change > 16).mean())
         mean_change = float(change.mean())
-        motion = 999.0
-        if self._previous_gray is not None:
-            motion = float(cv2.absdiff(current, self._previous_gray).mean())
+        motion = float(cv2.absdiff(current, self._previous_gray).mean()) if self._previous_gray is not None else 999.0
         self._previous_gray = current
         scene_changed = changed_ratio >= 0.14 or mean_change >= 6.5
-
         if not scene_changed:
             self._stable_frames = 0
             self._armed = True
@@ -356,22 +366,16 @@ class ScannerTab(QWidget):
             return
 
         self._stable_frames = self._stable_frames + 1 if motion <= 4.2 else 0
-        progress = min(100, int((self._stable_frames / 10) * 100))
-        self.placement_status.setText(f"Card detected. Hold still while focus settles… {progress}%")
-        if self._stable_frames >= 10:
+        progress = min(100, int((self._stable_frames / 8) * 100))
+        self.placement_status.setText(f"Card detected. Hold still… {progress}%")
+        if self._stable_frames >= 8:
             self._capture_pending = True
             self._armed = False
-            self.placement_status.setText("Card steady — selecting the sharpest temporary frame…")
-            QTimer.singleShot(650, self.capture_card)
+            self.placement_status.setText("Card steady — capturing a temporary still…")
+            QTimer.singleShot(250, self.capture_card)
 
     def _display_frame(self, frame) -> None:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        height, width, channels = rgb.shape
-        image = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(image.copy()).scaled(
-            self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        pixmap = self._frame_to_pixmap(frame, self.preview.size())
         painter = QPainter(pixmap)
         left, top, guide_width, guide_height = self._guide_rect(pixmap.width(), pixmap.height())
         painter.setPen(QPen(Qt.GlobalColor.white, 3))
@@ -380,10 +384,21 @@ class ScannerTab(QWidget):
         if str(self.settings.value("scanner/mode", "full")) == "identifier":
             painter.drawRect(left, top, guide_width, guide_height)
         else:
-            strip_top = top + int(guide_height * 0.67)
-            painter.drawRect(left, strip_top, guide_width, max(1, int(guide_height * 0.30)))
+            strip_top = top + int(guide_height * 0.64)
+            painter.drawRect(left, strip_top, guide_width, max(1, int(guide_height * 0.35)))
         painter.end()
         self.preview.setPixmap(pixmap)
+
+    @staticmethod
+    def _frame_to_pixmap(frame, size) -> QPixmap:
+        if len(frame.shape) == 2:
+            image = QImage(frame.data, frame.shape[1], frame.shape[0], frame.shape[1], QImage.Format.Format_Grayscale8)
+        else:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.shape[2] * rgb.shape[1], QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(image.copy()).scaled(
+            size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        )
 
     @staticmethod
     def _sharpness(frame) -> float:
@@ -394,9 +409,9 @@ class ScannerTab(QWidget):
         if self.current_frame is None or self.camera is None:
             QMessageBox.information(self, "Capture", "Start the camera and place a card in view first.")
             return
-        orientation = str(self.settings.value("scanner/orientation", "auto"))
+        orientation = str(self.settings.value("scanner/orientation", "landscape"))
         candidates = [self.current_frame.copy()]
-        for _ in range(5):
+        for _ in range(2):
             ok, frame = self.camera.read()
             if ok:
                 candidates.append(self._rotate_frame(frame, orientation))
@@ -406,16 +421,23 @@ class ScannerTab(QWidget):
         self._display_frame(self.captured_frame)
         self.capture_button.setEnabled(False)
         self.resume_button.setEnabled(True)
-        self.placement_status.setText("Sharpest still selected. Reading card identifiers…")
-        self.run_ocr()
+        self.enhanced_button.setEnabled(True)
+        self.placement_status.setText("Temporary still captured. Running fast OCR…")
+        self.run_ocr(enhanced=False)
 
-    def run_ocr(self) -> None:
+    def retry_enhanced_ocr(self) -> None:
+        if self.captured_frame is None:
+            QMessageBox.information(self, "Enhanced OCR", "There is no current capture to retry.")
+            return
+        self.run_ocr(enhanced=True)
+
+    def run_ocr(self, enhanced: bool = False) -> None:
         if self.captured_frame is None:
             return
-        self.ocr_status.setText("Reading card identifiers…")
+        self.ocr_status.setText("Running enhanced OCR…" if enhanced else "Running fast OCR…")
         mode = str(self.settings.value("scanner/mode", "full"))
         try:
-            result = self.ocr.read_card(self.captured_frame, mode=mode)
+            result = self.ocr.read_card(self.captured_frame, mode=mode, enhanced=enhanced)
         except RuntimeError as exc:
             self.ocr_status.setText("OCR unavailable. Manual identification still works.")
             QMessageBox.warning(self, "OCR unavailable", str(exc))
@@ -426,9 +448,8 @@ class ScannerTab(QWidget):
             QMessageBox.warning(self, "OCR failed", str(exc))
             self._resume_after_failed_read()
             return
-        finally:
-            self.captured_frame = None
 
+        self._show_debug_result(result, enhanced)
         self.card_name_input.clear()
         self.set_input.clear()
         self.number_input.clear()
@@ -444,13 +465,11 @@ class ScannerTab(QWidget):
         if result.card_name and result.confidence >= 60:
             self.card_name_input.setText(result.card_name)
 
-        details = [f"OCR confidence: {result.confidence}%"]
+        details = [f"OCR confidence: {result.confidence}%", f"time: {result.processing_ms} ms"]
         if result.set_code:
             details.append(f"set: {result.set_code}")
         if result.collector_number:
-            number = result.collector_number
-            if result.printed_total:
-                number += f"/{result.printed_total}"
+            number = result.collector_number + (f"/{result.printed_total}" if result.printed_total else "")
             details.append(f"number: {number}")
         self.ocr_status.setText(" • ".join(details))
 
@@ -461,20 +480,31 @@ class ScannerTab(QWidget):
             self.matches_table.selectRow(0)
             self.placement_status.setText("Match ready. Choose quantity and add it to the queue.")
             return
-        self.ocr_status.setText(self.ocr_status.text() + " • Review manually; scanner rearmed")
-        self._resume_after_failed_read()
+        self.ocr_status.setText(self.ocr_status.text() + " • Review debug output or retry enhanced OCR")
+        self.placement_status.setText("Review the debug panel. Remove the card and resume when finished.")
+
+    def _show_debug_result(self, result: OCRResult, enhanced: bool) -> None:
+        if result.crop_image is not None:
+            self.debug_crop.setPixmap(self._frame_to_pixmap(result.crop_image, self.debug_crop.size()))
+        if result.processed_image is not None:
+            self.debug_processed.setPixmap(self._frame_to_pixmap(result.processed_image, self.debug_processed.size()))
+        self.debug_metrics.setText(
+            f"Pass: {'Enhanced' if enhanced else 'Fast'} • Processing: {result.processing_ms} ms • "
+            f"Crop sharpness: {result.sharpness:.1f} • Confidence: {result.confidence}%"
+        )
+        self.debug_text.setPlainText(result.raw_text or "No text returned by Tesseract.")
 
     def _resume_after_failed_read(self) -> None:
         if self.camera is not None and self.camera.isOpened():
+            self.captured_frame = None
+            self.enhanced_button.setEnabled(False)
             self.timer.start(30)
             self.capture_button.setEnabled(True)
             self.resume_button.setEnabled(False)
             self._capture_pending = False
             self._stable_frames = 0
             self._armed = False
-            self.placement_status.setText(
-                "Remove this card to rearm. Click Reset Auto Capture if the guide does not clear."
-            )
+            self.placement_status.setText("Remove this card to rearm. Click Reset Auto Capture if needed.")
 
     def resume_live_view(self) -> None:
         self._resume_after_failed_read()
@@ -492,8 +522,7 @@ class ScannerTab(QWidget):
             QMessageBox.information(self, "Identify card", "Enter a set acronym, number, or card name.")
             return
         self.matches = self.catalog.search_cards(
-            name=name, set_query=set_query, number=number,
-            printed_total=printed_total, limit=100,
+            name=name, set_query=set_query, number=number, printed_total=printed_total, limit=100,
         )
         self.matches_table.setRowCount(len(self.matches))
         for row, card in enumerate(self.matches):
