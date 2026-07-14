@@ -44,8 +44,6 @@ class ScannerTab(QWidget):
         self.matches: list[dict] = []
         self.queue: list[dict] = []
 
-        # Auto-capture state. The detector first learns the empty guide, then waits
-        # for a meaningful scene change that becomes stable.
         self._baseline_gray = None
         self._previous_gray = None
         self._baseline_frames = 0
@@ -68,7 +66,8 @@ class ScannerTab(QWidget):
 
         note = QLabel(
             "Start with the guide empty for a moment. Then place a card inside the white guide "
-            "and hold it still. The app will capture one temporary still automatically."
+            "and hold it still. The app captures a temporary still and prioritizes the collector "
+            "number and printed set total; a printed set acronym is not required."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #888888;")
@@ -120,7 +119,7 @@ class ScannerTab(QWidget):
         self.card_name_input = QLineEdit()
         self.card_name_input.setPlaceholderText("Card name, optional")
         self.set_input = QLineEdit()
-        self.set_input.setPlaceholderText("Set name or code")
+        self.set_input.setPlaceholderText("Set name or code, optional")
         self.number_input = QLineEdit()
         self.number_input.setPlaceholderText("Collector number")
         for widget in (self.card_name_input, self.set_input, self.number_input):
@@ -277,17 +276,13 @@ class ScannerTab(QWidget):
 
         current = self._prepare_detection_frame(frame)
 
-        # Learn a stable empty-guide baseline on camera startup.
         if self._baseline_gray is None:
             if self._previous_gray is None:
                 self._previous_gray = current
                 return
             motion = float(cv2.absdiff(current, self._previous_gray).mean())
             self._previous_gray = current
-            if motion <= 2.5:
-                self._baseline_frames += 1
-            else:
-                self._baseline_frames = 0
+            self._baseline_frames = self._baseline_frames + 1 if motion <= 2.5 else 0
             self.placement_status.setText(
                 f"Calibrating empty guide… {min(100, self._baseline_frames * 10)}%"
             )
@@ -304,17 +299,12 @@ class ScannerTab(QWidget):
         if self._previous_gray is not None:
             motion = float(cv2.absdiff(current, self._previous_gray).mean())
         self._previous_gray = current
+        scene_changed = changed_ratio >= 0.18 or mean_change >= 8.0
 
-        scene_changed = changed_ratio >= 0.20 or mean_change >= 10.0
-
-        # After one scan, require the card to be removed before arming again.
         if self._needs_clear:
-            if not scene_changed:
-                self._clear_frames += 1
-            else:
-                self._clear_frames = 0
+            self._clear_frames = self._clear_frames + 1 if not scene_changed else 0
             self.placement_status.setText("Remove the scanned card to arm the next capture.")
-            if self._clear_frames >= 6:
+            if self._clear_frames >= 5:
                 self._needs_clear = False
                 self._stable_frames = 0
                 self.placement_status.setText("Ready — place the next card inside the guide.")
@@ -325,13 +315,8 @@ class ScannerTab(QWidget):
             self.placement_status.setText("Ready — place a card inside the white guide.")
             return
 
-        # The card/hand has entered the guide. Capture only after the view settles.
-        if motion <= 2.8:
-            self._stable_frames += 1
-        else:
-            self._stable_frames = 0
-
-        required = 10
+        self._stable_frames = self._stable_frames + 1 if motion <= 3.5 else 0
+        required = 8
         progress = min(100, int((self._stable_frames / required) * 100))
         self.placement_status.setText(
             f"Card detected. Hold still… {progress}% (scene change {int(changed_ratio * 100)}%)"
@@ -388,10 +373,12 @@ class ScannerTab(QWidget):
         except RuntimeError as exc:
             self.ocr_status.setText("OCR unavailable. Manual identification still works.")
             QMessageBox.warning(self, "OCR unavailable", str(exc))
+            self._resume_after_failed_read()
             return
         except Exception as exc:
             self.ocr_status.setText("OCR could not read this capture. Try better lighting or manual entry.")
             QMessageBox.warning(self, "OCR failed", str(exc))
+            self._resume_after_failed_read()
             return
         finally:
             self.captured_frame = None
@@ -403,7 +390,10 @@ class ScannerTab(QWidget):
         self.matches_table.setRowCount(0)
 
         if result.collector_number:
-            self.number_input.setText(result.collector_number)
+            display_number = result.collector_number
+            if result.printed_total:
+                display_number = f"{display_number}/{result.printed_total}"
+            self.number_input.setText(display_number)
         if result.set_code:
             self.set_input.setText(result.set_code)
         if result.card_name and result.confidence >= 55:
@@ -412,29 +402,55 @@ class ScannerTab(QWidget):
         threshold = int(self.settings.value("scanner/confidence", 90))
         pieces = [f"OCR confidence: {result.confidence}%"]
         if result.collector_number:
-            pieces.append(f"number: {result.collector_number}")
+            number_text = result.collector_number
+            if result.printed_total:
+                number_text += f"/{result.printed_total}"
+            pieces.append(f"number: {number_text}")
         if result.set_code:
             pieces.append(f"set: {result.set_code}")
         if result.card_name and result.confidence >= 55:
             pieces.append(f"name: {result.card_name}")
         self.ocr_status.setText(" • ".join(pieces))
 
-        if result.collector_number or result.set_code or (result.card_name and result.confidence >= 55):
-            self.find_matches()
-            if result.confidence >= threshold and len(self.matches) == 1:
-                self.matches_table.selectRow(0)
-                self.ocr_status.setText(
-                    self.ocr_status.text() + " • High-confidence single match selected"
-                )
-            elif result.confidence < threshold:
-                self.ocr_status.setText(self.ocr_status.text() + " • Below threshold; review before adding")
+        has_identifier = bool(
+            result.collector_number
+            or result.set_code
+            or (result.card_name and result.confidence >= 55)
+        )
+        if has_identifier:
+            self.find_matches(printed_total=result.printed_total)
+
+        accepted = result.confidence >= threshold and len(self.matches) == 1
+        if accepted:
+            self.matches_table.selectRow(0)
+            self.ocr_status.setText(
+                self.ocr_status.text() + " • High-confidence single match selected"
+            )
+            self.placement_status.setText("Match ready. Choose quantity and add it to the queue.")
+            return
+
+        if result.confidence < threshold:
+            self.ocr_status.setText(
+                self.ocr_status.text() + " • Below threshold; scanner rearmed for the next card"
+            )
+        elif len(self.matches) != 1:
+            self.ocr_status.setText(
+                self.ocr_status.text() + " • No unique match; scanner rearmed for the next card"
+            )
         else:
             self.ocr_status.setText(
-                f"OCR confidence: {result.confidence}% • No reliable collector information found. "
-                "Try again with the card flatter and closer, or identify it manually."
+                f"OCR confidence: {result.confidence}% • No reliable collector information found."
             )
 
-        self.placement_status.setText("Review the result, then add it or resume for another card.")
+        self._resume_after_failed_read()
+
+    def _resume_after_failed_read(self) -> None:
+        if self.camera is not None and self.camera.isOpened():
+            self._reset_auto_capture(learn_baseline=False)
+            self.timer.start(30)
+            self.capture_button.setEnabled(True)
+            self.resume_button.setEnabled(False)
+            self.placement_status.setText("Remove this card to arm the next capture.")
 
     def resume_live_view(self) -> None:
         if self.camera is not None and self.camera.isOpened():
@@ -444,10 +460,16 @@ class ScannerTab(QWidget):
             self.resume_button.setEnabled(False)
             self.placement_status.setText("Remove the scanned card to arm the next capture.")
 
-    def find_matches(self) -> None:
+    def find_matches(self, printed_total: int | None = None) -> None:
         name = self.card_name_input.text().strip()
         set_query = self.set_input.text().strip()
-        number = self.number_input.text().strip()
+        number_text = self.number_input.text().strip()
+        number = number_text.split("/")[0] if number_text else ""
+        if printed_total is None and "/" in number_text:
+            total_text = number_text.split("/", 1)[1].strip()
+            if total_text.isdigit():
+                printed_total = int(total_text)
+
         if not name and not set_query and not number:
             QMessageBox.information(self, "Identify card", "Enter a name, set, or collector number.")
             return
@@ -456,6 +478,7 @@ class ScannerTab(QWidget):
             name=name,
             set_query=set_query,
             number=number,
+            printed_total=printed_total,
             limit=100,
         )
         self.matches_table.setRowCount(len(self.matches))
