@@ -24,7 +24,12 @@ class OCRResult:
 
 
 class CardOCREngine:
-    """Extract likely card name and collector information from a guided card crop."""
+    """Extract card identifiers without saving scan images to disk.
+
+    All image processing happens in memory. The source frame and derived OCR
+    buffers are wiped after a successful read so only the resulting text and
+    catalog match data remain available to the scanner workflow.
+    """
 
     NUMBER_PATTERNS = (
         re.compile(r"\b([A-Z]{0,3}\d{1,3})\s*/\s*\d{1,3}\b", re.IGNORECASE),
@@ -73,6 +78,14 @@ class CardOCREngine:
         text = re.sub(r"\b(?:BASIC|STAGE\s*[12]|TRAINER|ENERGY|HP\s*\d+)\b", "", text, flags=re.I)
         return re.sub(r"\s+", " ", text).strip(" -")
 
+    @staticmethod
+    def _wipe_image(image: Any) -> None:
+        """Best-effort clearing of an in-memory NumPy/OpenCV image buffer."""
+        try:
+            image.fill(0)
+        except Exception:
+            pass
+
     def read_card(self, frame: Any) -> OCRResult:
         if not self.available():
             raise RuntimeError(
@@ -87,64 +100,72 @@ class CardOCREngine:
         top_prepared = self._prepare(top_region, 3.0)
         bottom_prepared = self._prepare(bottom_region, 3.5)
 
-        top_data = pytesseract.image_to_data(
-            top_prepared,
-            output_type=Output.DICT,
-            config="--oem 3 --psm 6",
-        )
-        bottom_data = pytesseract.image_to_data(
-            bottom_prepared,
-            output_type=Output.DICT,
-            config="--oem 3 --psm 6",
-        )
+        try:
+            top_data = pytesseract.image_to_data(
+                top_prepared,
+                output_type=Output.DICT,
+                config="--oem 3 --psm 6",
+            )
+            bottom_data = pytesseract.image_to_data(
+                bottom_prepared,
+                output_type=Output.DICT,
+                config="--oem 3 --psm 6",
+            )
 
-        def words_and_conf(data: dict[str, Any]) -> tuple[list[str], list[float]]:
-            words: list[str] = []
-            confidences: list[float] = []
-            for text, confidence in zip(data.get("text", []), data.get("conf", [])):
-                clean = str(text).strip()
-                try:
-                    score = float(confidence)
-                except (TypeError, ValueError):
-                    score = -1
-                if clean and score >= 0:
-                    words.append(clean)
-                    confidences.append(score)
-            return words, confidences
+            def words_and_conf(data: dict[str, Any]) -> tuple[list[str], list[float]]:
+                words: list[str] = []
+                confidences: list[float] = []
+                for text, confidence in zip(data.get("text", []), data.get("conf", [])):
+                    clean = str(text).strip()
+                    try:
+                        score = float(confidence)
+                    except (TypeError, ValueError):
+                        score = -1
+                    if clean and score >= 0:
+                        words.append(clean)
+                        confidences.append(score)
+                return words, confidences
 
-        top_words, top_conf = words_and_conf(top_data)
-        bottom_words, bottom_conf = words_and_conf(bottom_data)
-        top_text = " ".join(top_words)
-        bottom_text = " ".join(bottom_words)
-        raw_text = f"{top_text}\n{bottom_text}".strip()
+            top_words, top_conf = words_and_conf(top_data)
+            bottom_words, bottom_conf = words_and_conf(bottom_data)
+            top_text = " ".join(top_words)
+            bottom_text = " ".join(bottom_words)
+            raw_text = f"{top_text}\n{bottom_text}".strip()
 
-        card_name = self._clean_name(top_text)
-        if len(card_name.split()) > 6:
-            card_name = " ".join(card_name.split()[:6])
+            card_name = self._clean_name(top_text)
+            if len(card_name.split()) > 6:
+                card_name = " ".join(card_name.split()[:6])
 
-        set_code = ""
-        collector_number = ""
-        for pattern in self.NUMBER_PATTERNS:
-            match = pattern.search(bottom_text.replace("|", "/"))
-            if not match:
-                continue
-            groups = match.groups()
-            if len(groups) == 1:
-                collector_number = groups[0].upper()
-            elif groups[0].upper() in {"SVP", "SWSH", "SM", "XY", "BW"}:
-                set_code = groups[0].upper()
-                collector_number = groups[1]
-            else:
-                collector_number = "".join(groups).upper()
-            break
+            set_code = ""
+            collector_number = ""
+            for pattern in self.NUMBER_PATTERNS:
+                match = pattern.search(bottom_text.replace("|", "/"))
+                if not match:
+                    continue
+                groups = match.groups()
+                if len(groups) == 1:
+                    collector_number = groups[0].upper()
+                elif groups[0].upper() in {"SVP", "SWSH", "SM", "XY", "BW"}:
+                    set_code = groups[0].upper()
+                    collector_number = groups[1]
+                else:
+                    collector_number = "".join(groups).upper()
+                break
 
-        all_conf = [score for score in top_conf + bottom_conf if score >= 0]
-        confidence = int(round(sum(all_conf) / len(all_conf))) if all_conf else 0
+            all_conf = [score for score in top_conf + bottom_conf if score >= 0]
+            confidence = int(round(sum(all_conf) / len(all_conf))) if all_conf else 0
 
-        return OCRResult(
-            card_name=card_name,
-            set_code=set_code,
-            collector_number=collector_number,
-            confidence=max(0, min(100, confidence)),
-            raw_text=raw_text,
-        )
+            return OCRResult(
+                card_name=card_name,
+                set_code=set_code,
+                collector_number=collector_number,
+                confidence=max(0, min(100, confidence)),
+                raw_text=raw_text,
+            )
+        finally:
+            # Scans are temporary working data. Nothing is written to disk, and
+            # these buffers are cleared as soon as OCR has finished using them.
+            self._wipe_image(top_prepared)
+            self._wipe_image(bottom_prepared)
+            self._wipe_image(card)
+            self._wipe_image(frame)
