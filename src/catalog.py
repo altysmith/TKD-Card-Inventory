@@ -22,9 +22,6 @@ class PokemonCatalog:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            # Create the base tables first. Existing catalogs may not yet have the
-            # enriched columns, so indexes that reference those columns must be
-            # created only after the migration below completes.
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS cards (
@@ -70,6 +67,8 @@ class PokemonCatalog:
                     ON cards(set_code COLLATE NOCASE, collector_number_numeric);
                 CREATE INDEX IF NOT EXISTS idx_cards_number
                     ON cards(collector_number_numeric);
+                CREATE INDEX IF NOT EXISTS idx_cards_total_number
+                    ON cards(printed_total, collector_number_numeric);
                 CREATE INDEX IF NOT EXISTS idx_cards_category
                     ON cards(card_category COLLATE NOCASE);
                 """
@@ -166,17 +165,21 @@ class PokemonCatalog:
         number: str = "",
         set_query: str = "",
         category: str = "",
+        printed_total: int | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         parameters: list[Any] = []
+
         if name.strip():
             clauses.append("card_name LIKE ? COLLATE NOCASE")
             parameters.append(f"%{name.strip()}%")
+
         if set_query.strip():
             clauses.append("(set_name LIKE ? COLLATE NOCASE OR set_code LIKE ? COLLATE NOCASE)")
             pattern = f"%{set_query.strip()}%"
             parameters.extend([pattern, pattern])
+
         if number.strip():
             raw_number = number.strip().split("/")[0]
             if raw_number.isdigit():
@@ -185,11 +188,18 @@ class PokemonCatalog:
             else:
                 clauses.append("collector_number LIKE ? COLLATE NOCASE")
                 parameters.append(raw_number)
+
+        if printed_total is not None:
+            clauses.append("printed_total = ?")
+            parameters.append(int(printed_total))
+
         if category.strip():
             clauses.append("card_category = ? COLLATE NOCASE")
             parameters.append(category.strip())
+
         if not clauses:
             return []
+
         parameters.append(limit)
         query = f"""
             SELECT * FROM cards
@@ -212,6 +222,7 @@ class PokemonCatalog:
             "name": row["card_name"],
             "number": display_number,
             "raw_number": row["collector_number"],
+            "printed_total": row["printed_total"],
             "rarity": row["rarity"] or "",
             "set_name": row["set_name"],
             "set_code": row["set_code"] or "",
