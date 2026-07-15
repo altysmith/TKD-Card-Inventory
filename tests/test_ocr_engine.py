@@ -71,6 +71,24 @@ class CardOCREngineTests(unittest.TestCase):
         self.assertEqual("0677066", matched_text)
         self.assertEqual(0.0, confidence)
 
+    def test_targeted_number_beats_implausible_full_strip_fraction(self) -> None:
+        attempts = [
+            ("0XBK057/0051K", 8.0, "EasyOCR full strip"),
+            ("BLK", 50.0, "EasyOCR set binary"),
+            ("06700865", 9.0, "EasyOCR number binary"),
+            ("067/066", 0.0, "Tesseract number enhanced"),
+        ]
+
+        code, collector, total, matched_text, confidence = (
+            self.engine._parse_attempts(attempts)
+        )
+
+        self.assertEqual("BLK", code)
+        self.assertEqual("67", collector)
+        self.assertEqual(66, total)
+        self.assertEqual("067/066", matched_text)
+        self.assertEqual(0.0, confidence)
+
     def test_garbage_text_does_not_report_full_identifier_evidence(self) -> None:
         texts = ["H", "11B05015", "1", "G86"]
 

@@ -286,6 +286,29 @@ class CardOCREngine:
             return str(collector_value), total_value
         return "", None
 
+    @classmethod
+    def _collector_candidate_score(
+        cls,
+        collector: str,
+        total: int | None,
+        text: str,
+        confidence: float,
+        source: str,
+    ) -> float:
+        """Prefer targeted, identifier-shaped reads over full-strip guesses."""
+        score = float(confidence)
+        if "number" in source.casefold():
+            score += 100.0
+        if "/" in cls._normalize(text):
+            score += 10.0
+        if total is not None and total >= 10:
+            score += 10.0
+        elif total is not None:
+            score -= 30.0
+        if collector.isdigit() and total and int(collector) > total * 3:
+            score -= 20.0
+        return score
+
     def _parse_attempts(
         self, attempts: list[tuple[str, float, str]]
     ) -> tuple[str, str, int | None, str, float]:
@@ -294,6 +317,7 @@ class CardOCREngine:
         best_collector = ""
         best_total: int | None = None
         best_collector_confidence = -1.0
+        best_collector_selection_score = float("-inf")
         best_text = ""
         best_confidence = 0.0
 
@@ -321,10 +345,14 @@ class CardOCREngine:
             if code and confidence >= 5.0 and confidence > best_code_confidence:
                 best_code = code
                 best_code_confidence = confidence
-            if collector and confidence > best_collector_confidence:
+            collector_selection_score = self._collector_candidate_score(
+                collector, total, text, confidence, source
+            )
+            if collector and collector_selection_score > best_collector_selection_score:
                 best_collector = collector
                 best_total = total
                 best_collector_confidence = confidence
+                best_collector_selection_score = collector_selection_score
                 best_text = text
                 best_confidence = confidence
 

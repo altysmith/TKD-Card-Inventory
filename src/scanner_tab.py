@@ -609,11 +609,17 @@ class ScannerTab(QWidget):
                 else 0.0
             )
             if best_code and best_score >= 0.60 and best_score - second_score >= 0.15:
+                self.matches = [
+                    card
+                    for card in self.matches
+                    if str(card.get("set_code", "")).casefold()
+                    == best_code.casefold()
+                ]
                 self.set_input.setText(best_code)
                 self.number_input.setText(str(self.matches[0].get("number", number)))
                 self.ocr_status.setText(
                     self.ocr_status.text()
-                    + f" | Catalog corrected set hint {set_query} to {best_code}"
+                    + f" | Catalog resolved {best_code} {self.matches[0].get('number', number)}"
                 )
         self.matches_table.setRowCount(len(self.matches))
         for row, card in enumerate(self.matches):
