@@ -547,6 +547,64 @@ class ScannerTab(QWidget):
             printed_total=printed_total,
             limit=100,
         )
+        used_relaxed_identifier_match = False
+        if not self.matches and set_query and number:
+            # Keep the reliable collector fraction exact while relaxing only
+            # the noisy set badge. For 67/86 this narrows the catalog to three
+            # candidates before BLN is compared with the real BLK code.
+            self.matches = self.catalog.search_cards(
+                name=name,
+                number=number,
+                printed_total=printed_total,
+                limit=100,
+            )
+            self.matches = self.ocr.rank_catalog_candidates(
+                self.matches, set_query
+            )
+            used_relaxed_identifier_match = bool(self.matches)
+
+        if not self.matches and number:
+            # OCR commonly gets one character of a small set badge or printed
+            # total wrong (for example BLK -> BLN or 086 -> 066). The collector
+            # number is usually more reliable, so retrieve its candidates and
+            # let the catalog rank/correct the noisy fields.
+            self.matches = self.catalog.search_cards(
+                name=name,
+                number=number,
+                limit=100,
+            )
+            if set_query:
+                self.matches = self.ocr.rank_catalog_candidates(
+                    self.matches, set_query
+                )
+            used_relaxed_identifier_match = bool(self.matches)
+
+        if self.matches and len(self.matches) == 1 and number and not set_query:
+            best_code = str(self.matches[0].get("set_code", ""))
+            if best_code:
+                self.set_input.setText(best_code)
+                self.number_input.setText(str(self.matches[0].get("number", number)))
+                self.ocr_status.setText(
+                    self.ocr_status.text()
+                    + f" | Catalog identified set {best_code}"
+                )
+        elif used_relaxed_identifier_match and set_query:
+            best_code = str(self.matches[0].get("set_code", ""))
+            best_score = self.ocr.set_code_similarity(set_query, best_code)
+            second_score = (
+                self.ocr.set_code_similarity(
+                    set_query, str(self.matches[1].get("set_code", ""))
+                )
+                if len(self.matches) > 1
+                else 0.0
+            )
+            if best_code and best_score >= 0.60 and best_score - second_score >= 0.15:
+                self.set_input.setText(best_code)
+                self.number_input.setText(str(self.matches[0].get("number", number)))
+                self.ocr_status.setText(
+                    self.ocr_status.text()
+                    + f" | Catalog corrected set hint {set_query} to {best_code}"
+                )
         self.matches_table.setRowCount(len(self.matches))
         for row, card in enumerate(self.matches):
             values = [
