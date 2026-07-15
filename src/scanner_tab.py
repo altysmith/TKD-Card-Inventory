@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from .catalog import PokemonCatalog
 from .database import InventoryDatabase
 from .ocr_engine import CardOCREngine, OCRResult
+from .scan_logger import ScanLogger
 
 
 class ScannerTab(QWidget):
@@ -30,6 +31,8 @@ class ScannerTab(QWidget):
 
     CARD_ASPECT_RATIO = 0.714
     BURST_FRAME_COUNT = 6
+    UNSTABLE_EXTRA_FRAMES = 4
+    STABILITY_THRESHOLD = 65
 
     def __init__(
         self,
@@ -44,12 +47,16 @@ class ScannerTab(QWidget):
         self.inventory_changed = inventory_changed
         self.settings = settings
         self.ocr = CardOCREngine()
+        self.scan_logger = ScanLogger(database.path.parent / "scan_history.csv")
 
         self.camera: cv2.VideoCapture | None = None
         self.current_frame = None
         self.captured_frame = None
         self.matches: list[dict] = []
         self.queue: list[dict] = []
+        self._catalog_match_decisive = False
+        self.last_capture_stability = 100
+        self.last_burst_size = 0
         self._active_signature: tuple[int, str, str, str] | None = None
 
         self.timer = QTimer(self)
@@ -411,8 +418,19 @@ class ScannerTab(QWidget):
                 candidates.append(self._rotate_frame(frame, orientation))
 
         mode = str(self.settings.value("scanner/mode", "full"))
-        self.captured_frame = max(
-            candidates, key=lambda frame: self.ocr.capture_frame_score(frame, mode)
+        self.last_capture_stability = self.ocr.capture_stability(candidates, mode)
+        if self.last_capture_stability < self.STABILITY_THRESHOLD:
+            self.placement_status.setText(
+                "Camera is still settling; collecting a few extra frames..."
+            )
+            for _ in range(self.UNSTABLE_EXTRA_FRAMES):
+                ok, frame = self.camera.read()
+                if ok:
+                    candidates.append(self._rotate_frame(frame, orientation))
+            self.last_capture_stability = self.ocr.capture_stability(candidates, mode)
+        self.last_burst_size = len(candidates)
+        self.captured_frame, _title_frame, _identifier_frame = (
+            self.ocr.compose_best_capture(candidates, mode)
         )
         candidates.clear()
         self.timer.stop()
@@ -453,6 +471,7 @@ class ScannerTab(QWidget):
         self.set_input.clear()
         self.number_input.clear()
         self.matches = []
+        self._catalog_match_decisive = False
         self.matches_table.setRowCount(0)
 
         if result.set_code:
@@ -496,7 +515,7 @@ class ScannerTab(QWidget):
                     result.card_name if result.card_name_confidence >= 30.0 else ""
                 ),
                 prefer_name=result.card_name_confidence >= 30.0,
-                trust_set_hint=result.set_code_confidence >= 40.0,
+                trust_set_hint=result.set_code_confidence >= 70.0,
                 regulation_mark=(
                     result.regulation_mark
                     if result.regulation_mark_confidence >= 60.0
@@ -505,14 +524,15 @@ class ScannerTab(QWidget):
                 number_hints=result.number_hints,
             )
 
-        threshold = int(self.settings.value("scanner/confidence", 90))
-        if result.confidence >= threshold and len(self.matches) == 1:
+        if len(self.matches) == 1 and self._catalog_match_decisive:
+            self._log_scan(result, "automatic")
             self.matches_table.selectRow(0)
             self.placement_status.setText(
                 "Match ready. Choose quantity and add it to the queue, or return to live view."
             )
             return
 
+        self._log_scan(result, "review" if self.matches else "no_match")
         self.ocr_status.setText(
             self.ocr_status.text() + " • Review results or retry enhanced OCR"
         )
@@ -533,7 +553,43 @@ class ScannerTab(QWidget):
             f"Pass: {'Enhanced' if enhanced else 'Standard'} • Processing: {result.processing_ms} ms • "
             f"Crop sharpness: {result.sharpness:.1f} • Confidence: {result.confidence}%"
         )
+        self.debug_metrics.setText(
+            self.debug_metrics.text()
+            + f" | Burst stability: {self.last_capture_stability}% "
+            + f"({self.last_burst_size} frames)"
+        )
         self.debug_text.setPlainText(result.raw_text or "No OCR text was returned.")
+
+    def _log_scan(self, result: OCRResult, decision: str) -> None:
+        resolved = self.matches[0] if self._catalog_match_decisive and self.matches else {}
+        number_read = result.collector_number
+        if number_read and result.printed_total is not None:
+            number_read += f"/{result.printed_total}"
+        try:
+            self.scan_logger.append(
+                {
+                    "title_read": result.card_name,
+                    "set_read": result.set_code,
+                    "number_read": number_read,
+                    "regulation_read": result.regulation_mark,
+                    "ocr_confidence": result.confidence,
+                    "title_confidence": round(result.card_name_confidence, 1),
+                    "set_confidence": round(result.set_code_confidence, 1),
+                    "regulation_confidence": round(result.regulation_mark_confidence, 1),
+                    "processing_ms": result.processing_ms,
+                    "capture_stability": self.last_capture_stability,
+                    "burst_frames": self.last_burst_size,
+                    "candidate_count": len(self.matches),
+                    "decision": decision,
+                    "resolved_card_id": resolved.get("id", ""),
+                    "resolved_name": resolved.get("name", ""),
+                    "resolved_set": resolved.get("set_code", ""),
+                    "resolved_number": resolved.get("number", ""),
+                    "raw_ocr": result.raw_text,
+                }
+            )
+        except OSError:
+            pass
 
     def resume_live_view(self) -> None:
         if self.camera is None or not self.camera.isOpened():
@@ -557,6 +613,7 @@ class ScannerTab(QWidget):
         regulation_mark: str = "",
         number_hints: tuple[tuple[str, float], ...] = (),
     ) -> None:
+        self._catalog_match_decisive = False
         name = self.card_name_input.text().strip()
         set_query = self.set_input.text().strip()
         number_text = self.number_input.text().strip()
@@ -584,7 +641,11 @@ class ScannerTab(QWidget):
                 == 1.0
                 for card in title_candidates
             )
-            title_candidates, used_set_hint = self.ocr.narrow_exact_name_candidates(
+            (
+                title_candidates,
+                used_set_hint,
+                used_exact_identifier,
+            ) = self.ocr.narrow_exact_name_candidates(
                 title_candidates,
                 title_hint,
                 set_hint=set_query,
@@ -605,8 +666,7 @@ class ScannerTab(QWidget):
                 single_is_decisive = len(self.matches) == 1 and (
                     exact_title_count == 1
                     or used_set_hint
-                    or bool(number)
-                    or printed_total is not None
+                    or used_exact_identifier
                     or fragments_are_decisive
                 )
                 ignored_set_hint = bool(set_query and not used_set_hint)
@@ -618,6 +678,7 @@ class ScannerTab(QWidget):
                         + f" | Ignored conflicting set guess {ignored_code}"
                     )
                 if single_is_decisive:
+                    self._catalog_match_decisive = True
                     card = self.matches[0]
                     self.card_name_input.setText(str(card.get("name", title_hint)))
                     self.set_input.setText(str(card.get("set_code", "")))
@@ -719,6 +780,7 @@ class ScannerTab(QWidget):
                     + f"{card.get('set_code', set_query)} {card.get('number', number)}"
                 )
                 used_title_resolution = True
+                self._catalog_match_decisive = True
             else:
                 # Keep a short, useful review list instead of displaying an
                 # entire set when the title evidence is not decisive.
@@ -761,7 +823,7 @@ class ScannerTab(QWidget):
                     self.ocr_status.text()
                     + f" | Catalog resolved {best_code} {self.matches[0].get('number', number)}"
                 )
-        self._populate_matches_table()
+        self._populate_matches_table(select_first=self._catalog_match_decisive)
 
     def _populate_matches_table(self, select_first: bool = True) -> None:
         self.matches_table.setRowCount(len(self.matches))

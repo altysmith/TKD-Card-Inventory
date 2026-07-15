@@ -46,15 +46,17 @@ python -m src.main
 
 ## Local data
 
-The application stores its SQLite inventory database in the user's local application-data directory, not inside the Git repository. Exported CSV and Excel files are written to a folder selected by the user.
+The application stores its SQLite inventory database in the user's local application-data directory, not inside the Git repository. Scanner outcomes are appended to `scan_history.csv` in that same directory for accuracy analysis; card images are not saved. Exported CSV and Excel files are written to a folder selected by the user.
 
 ## Scanner design
 
 The scanner works offline after the catalog is downloaded. It straightens a
-detected card, reads independent title and identifier regions, and ranks local
+detected card, selects the clearest title and identifier regions from a short
+camera burst, reads them independently, and ranks local
 catalog candidates using all available evidence. A result is collapsed to one
-card only when the leading candidate is sufficiently separated from the
-runner-up; ambiguous prints remain available for manual review.
+card only when multiple compatible clues make it decisive. Partial collector
+numbers and printed totals never force automatic selection on their own;
+ambiguous prints remain available for manual review.
 
 Foil glare can still obscure printed details. A fixed camera position with
 soft, diffuse lighting gives the most repeatable results.

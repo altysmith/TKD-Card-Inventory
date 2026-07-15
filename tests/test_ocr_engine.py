@@ -222,7 +222,7 @@ class CardOCREngineTests(unittest.TestCase):
             },
         ]
 
-        narrowed, used_set = self.engine.narrow_exact_name_candidates(
+        narrowed, used_set, used_identifier = self.engine.narrow_exact_name_candidates(
             cards,
             "Slowpoke",
             set_hint="FCO",
@@ -230,6 +230,7 @@ class CardOCREngineTests(unittest.TestCase):
         )
 
         self.assertFalse(used_set)
+        self.assertFalse(used_identifier)
         self.assertEqual(["Slowpoke", "Slowpoke"], [card["name"] for card in narrowed])
         self.assertNotIn("Spoink", [card["name"] for card in narrowed])
 
@@ -251,7 +252,7 @@ class CardOCREngineTests(unittest.TestCase):
             },
         ]
 
-        narrowed, used_set = self.engine.narrow_exact_name_candidates(
+        narrowed, used_set, used_identifier = self.engine.narrow_exact_name_candidates(
             cards,
             "Slowpoke",
             set_hint="SCR",
@@ -259,6 +260,7 @@ class CardOCREngineTests(unittest.TestCase):
         )
 
         self.assertTrue(used_set)
+        self.assertFalse(used_identifier)
         self.assertEqual("57/142", narrowed[0]["number"])
         self.assertEqual(1, len(narrowed))
 
@@ -290,7 +292,7 @@ class CardOCREngineTests(unittest.TestCase):
             },
         ]
 
-        narrowed, _used_set = self.engine.narrow_exact_name_candidates(
+        narrowed, _used_set, _used_identifier = self.engine.narrow_exact_name_candidates(
             cards,
             "Slowpoke",
             regulation_mark="H",
@@ -298,6 +300,48 @@ class CardOCREngineTests(unittest.TestCase):
         )
 
         self.assertEqual(["SCR", "PRE"], [card["set_code"] for card in narrowed])
+
+    def test_collector_number_alone_does_not_force_one_print(self) -> None:
+        cards = [
+            {"name": "Slowpoke", "set_code": "SCR", "raw_number": "57", "printed_total": 142},
+            {"name": "Slowpoke", "set_code": "BKP", "raw_number": "57", "printed_total": 122},
+        ]
+        narrowed, _used_set, used_identifier = self.engine.narrow_exact_name_candidates(
+            cards, "Slowpoke", collector_hint="57", trust_set_hint=False
+        )
+        self.assertFalse(used_identifier)
+        self.assertEqual(2, len(narrowed))
+
+    def test_full_collector_fraction_is_atomic_decisive_evidence(self) -> None:
+        cards = [
+            {"name": "Slowpoke", "set_code": "SCR", "raw_number": "57", "printed_total": 142},
+            {"name": "Slowpoke", "set_code": "BKP", "raw_number": "57", "printed_total": 122},
+        ]
+        narrowed, _used_set, used_identifier = self.engine.narrow_exact_name_candidates(
+            cards,
+            "Slowpoke",
+            collector_hint="57",
+            printed_total=142,
+            trust_set_hint=False,
+        )
+        self.assertTrue(used_identifier)
+        self.assertEqual("SCR", narrowed[0]["set_code"])
+
+    def test_full_fraction_outweighs_a_conflicting_set_guess(self) -> None:
+        cards = [
+            {"name": "Slowpoke", "set_code": "SCR", "raw_number": "57", "printed_total": 142},
+            {"name": "Slowpoke", "set_code": "BKP", "raw_number": "57", "printed_total": 122},
+        ]
+        narrowed, used_set, used_identifier = self.engine.narrow_exact_name_candidates(
+            cards,
+            "Slowpoke",
+            set_hint="BKP",
+            collector_hint="57",
+            printed_total=142,
+        )
+        self.assertTrue(used_identifier)
+        self.assertFalse(used_set)
+        self.assertEqual("SCR", narrowed[0]["set_code"])
 
     def test_posted_number_fragments_resolve_scr_after_regulation_filter(self) -> None:
         cards = [

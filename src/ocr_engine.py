@@ -73,8 +73,9 @@ class CardOCREngine:
         return cls._easy_reader
 
     @classmethod
-    def crop_guided_area(cls, frame: Any, mode: str) -> Any:
-        height, width = frame.shape[:2]
+    def _guided_area_bounds(
+        cls, width: int, height: int, mode: str
+    ) -> tuple[int, int, int, int]:
         if mode == "identifier":
             guide_width = int(width * 0.88)
             guide_height = int(height * 0.38)
@@ -86,7 +87,13 @@ class CardOCREngine:
                 guide_height = int(guide_width / cls.CARD_ASPECT_RATIO)
         left = max(0, (width - guide_width) // 2)
         top = max(0, (height - guide_height) // 2)
-        return frame[top : top + guide_height, left : left + guide_width].copy()
+        return left, top, left + guide_width, top + guide_height
+
+    @classmethod
+    def crop_guided_area(cls, frame: Any, mode: str) -> Any:
+        height, width = frame.shape[:2]
+        left, top, right, bottom = cls._guided_area_bounds(width, height, mode)
+        return frame[top:bottom, left:right].copy()
 
     @staticmethod
     def _order_corners(points: Any) -> Any:
@@ -636,7 +643,7 @@ class CardOCREngine:
         printed_total: int | None = None,
         trust_set_hint: bool = True,
         regulation_mark: str = "",
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, bool]:
         """Let an exact title establish identity before optional identifier clues."""
         candidates = [
             card
@@ -644,7 +651,25 @@ class CardOCREngine:
             if cls.name_similarity(name_hint, str(card.get("name", ""))) == 1.0
         ]
         if not candidates:
-            return [], False
+            return [], False, False
+
+        used_exact_identifier = False
+        if collector_hint and printed_total is not None:
+            expected = re.sub(r"\D", "", collector_hint.split("/", 1)[0])
+            identifier_matches = [
+                card
+                for card in candidates
+                if re.sub(
+                    r"\D",
+                    "",
+                    str(card.get("raw_number", card.get("number", ""))).split("/", 1)[0],
+                )
+                == expected
+                and card.get("printed_total") == printed_total
+            ]
+            if identifier_matches:
+                candidates = identifier_matches
+                used_exact_identifier = True
 
         used_set_hint = False
         if set_hint and trust_set_hint:
@@ -660,21 +685,6 @@ class CardOCREngine:
                 candidates = set_matches
                 used_set_hint = True
 
-        if collector_hint:
-            expected = re.sub(r"\D", "", collector_hint.split("/", 1)[0])
-            number_matches = [
-                card
-                for card in candidates
-                if re.sub(
-                    r"\D",
-                    "",
-                    str(card.get("raw_number", card.get("number", ""))).split("/", 1)[0],
-                )
-                == expected
-            ]
-            if number_matches:
-                candidates = number_matches
-
         if regulation_mark:
             regulation_matches = [
                 card
@@ -685,16 +695,7 @@ class CardOCREngine:
             if regulation_matches:
                 candidates = regulation_matches
 
-        if printed_total is not None:
-            total_matches = [
-                card
-                for card in candidates
-                if card.get("printed_total") == printed_total
-            ]
-            if total_matches:
-                candidates = total_matches
-
-        return candidates, used_set_hint
+        return candidates, used_set_hint, used_exact_identifier
 
     @classmethod
     def number_fragment_score(
@@ -773,6 +774,94 @@ class CardOCREngine:
             clipped = float(np.count_nonzero(gray >= 250)) / float(gray.size)
             scores.append(log1p(sharpness) * 25.0 + contrast - clipped * 420.0)
         return sum(scores) / len(scores)
+
+    @classmethod
+    def compose_best_capture(
+        cls, frames: list[Any], mode: str
+    ) -> tuple[Any, int, int]:
+        """Use the clearest title and identifier regions from one aligned burst."""
+        if not frames:
+            raise ValueError("At least one capture frame is required.")
+        compatible = [frame for frame in frames if frame.shape == frames[0].shape]
+        overall_index = max(
+            range(len(compatible)),
+            key=lambda index: cls.capture_frame_score(compatible[index], mode),
+        )
+        output = compatible[overall_index].copy()
+        height, width = output.shape[:2]
+        left, top, right, bottom = cls._guided_area_bounds(width, height, mode)
+
+        def region_score(frame: Any, kind: str) -> float:
+            area = cls.crop_guided_area(frame, mode)
+            region = (
+                cls._title_region(area, mode)
+                if kind == "title"
+                else cls._identifier_strip(area, mode)
+            )
+            if region is None or not region.size:
+                return float("-inf")
+            gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+            sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            clipped = float(np.count_nonzero(gray >= 250)) / float(gray.size)
+            return log1p(sharpness) * 25.0 + float(gray.std()) - clipped * 420.0
+
+        identifier_index = max(
+            range(len(compatible)),
+            key=lambda index: region_score(compatible[index], "identifier"),
+        )
+        source_area = cls.crop_guided_area(compatible[identifier_index], mode)
+        area_height, area_width = source_area.shape[:2]
+        if mode == "identifier":
+            bounds = (
+                int(area_width * 0.02),
+                int(area_height * 0.58),
+                int(area_width * 0.62),
+                int(area_height * 0.94),
+            )
+        else:
+            bounds = (
+                int(area_width * 0.035),
+                int(area_height * 0.900),
+                int(area_width * 0.47),
+                int(area_height * 0.972),
+            )
+        x1, y1, x2, y2 = bounds
+        output[top + y1 : top + y2, left + x1 : left + x2] = source_area[
+            y1:y2, x1:x2
+        ]
+
+        title_index = overall_index
+        if mode != "identifier":
+            title_index = max(
+                range(len(compatible)),
+                key=lambda index: region_score(compatible[index], "title"),
+            )
+            source_area = cls.crop_guided_area(compatible[title_index], mode)
+            x1, y1, x2, y2 = cls._title_region_bounds(area_width, area_height)
+            output[top + y1 : top + y2, left + x1 : left + x2] = source_area[
+                y1:y2, x1:x2
+            ]
+        return output, title_index, identifier_index
+
+    @classmethod
+    def capture_stability(cls, frames: list[Any], mode: str) -> int:
+        """Estimate whether lighting and focus remained steady during a burst."""
+        if len(frames) < 2:
+            return 100
+        brightness: list[float] = []
+        sharpness: list[float] = []
+        for frame in frames:
+            region = cls._identifier_strip(cls.crop_guided_area(frame, mode), mode)
+            gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+            brightness.append(float(gray.mean()))
+            sharpness.append(log1p(float(cv2.Laplacian(gray, cv2.CV_64F).var())))
+        brightness_penalty = min(55.0, (max(brightness) - min(brightness)) * 2.2)
+        sharp_median = max(0.1, float(np.median(sharpness)))
+        sharp_penalty = min(
+            45.0,
+            ((max(sharpness) - min(sharpness)) / sharp_median) * 90.0,
+        )
+        return max(0, min(100, int(round(100.0 - brightness_penalty - sharp_penalty))))
 
     @staticmethod
     def _capture_quality(image: Any, sharpness: float) -> int:
