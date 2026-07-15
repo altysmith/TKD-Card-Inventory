@@ -477,6 +477,11 @@ class ScannerTab(QWidget):
             details.append(
                 f"title: {result.card_name} ({result.card_name_confidence:.0f}%)"
             )
+        if result.regulation_mark:
+            details.append(
+                f"regulation: {result.regulation_mark} "
+                f"({result.regulation_mark_confidence:.0f}%)"
+            )
         if result.collector_number:
             number = result.collector_number + (
                 f"/{result.printed_total}" if result.printed_total else ""
@@ -492,6 +497,12 @@ class ScannerTab(QWidget):
                 ),
                 prefer_name=result.card_name_confidence >= 30.0,
                 trust_set_hint=result.set_code_confidence >= 40.0,
+                regulation_mark=(
+                    result.regulation_mark
+                    if result.regulation_mark_confidence >= 60.0
+                    else ""
+                ),
+                number_hints=result.number_hints,
             )
 
         threshold = int(self.settings.value("scanner/confidence", 90))
@@ -543,6 +554,8 @@ class ScannerTab(QWidget):
         fuzzy_name_hint: str = "",
         prefer_name: bool = False,
         trust_set_hint: bool = True,
+        regulation_mark: str = "",
+        number_hints: tuple[tuple[str, float], ...] = (),
     ) -> None:
         name = self.card_name_input.text().strip()
         set_query = self.set_input.text().strip()
@@ -564,6 +577,13 @@ class ScannerTab(QWidget):
                 name=title_hint,
                 limit=500,
             )
+            exact_title_count = sum(
+                self.ocr.name_similarity(
+                    title_hint, str(card.get("name", ""))
+                )
+                == 1.0
+                for card in title_candidates
+            )
             title_candidates, used_set_hint = self.ocr.narrow_exact_name_candidates(
                 title_candidates,
                 title_hint,
@@ -571,9 +591,24 @@ class ScannerTab(QWidget):
                 collector_hint=number,
                 printed_total=printed_total,
                 trust_set_hint=trust_set_hint,
+                regulation_mark=regulation_mark,
             )
             if title_candidates:
-                self.matches = title_candidates
+                self.matches = self.ocr.rank_number_fragment_candidates(
+                    title_candidates, number_hints
+                )
+                fragments_are_decisive = self.ocr.decisive_number_fragment_match(
+                    self.matches, number_hints
+                )
+                if fragments_are_decisive:
+                    self.matches = self.matches[:1]
+                single_is_decisive = len(self.matches) == 1 and (
+                    exact_title_count == 1
+                    or used_set_hint
+                    or bool(number)
+                    or printed_total is not None
+                    or fragments_are_decisive
+                )
                 ignored_set_hint = bool(set_query and not used_set_hint)
                 if ignored_set_hint:
                     ignored_code = set_query
@@ -582,7 +617,7 @@ class ScannerTab(QWidget):
                         self.ocr_status.text()
                         + f" | Ignored conflicting set guess {ignored_code}"
                     )
-                if len(self.matches) == 1:
+                if single_is_decisive:
                     card = self.matches[0]
                     self.card_name_input.setText(str(card.get("name", title_hint)))
                     self.set_input.setText(str(card.get("set_code", "")))
@@ -592,12 +627,17 @@ class ScannerTab(QWidget):
                         + f" | Catalog resolved {card.get('name', title_hint)} "
                         + f"{card.get('set_code', '')} {card.get('number', '')}"
                     )
+                elif len(self.matches) == 1:
+                    self.ocr_status.setText(
+                        self.ocr_status.text()
+                        + " | One print suggested by supporting evidence; confirmation required"
+                    )
                 else:
                     self.ocr_status.setText(
                         self.ocr_status.text()
                         + f" | Exact title found; {len(self.matches)} prints need set or number confirmation"
                     )
-                self._populate_matches_table(select_first=len(self.matches) == 1)
+                self._populate_matches_table(select_first=single_is_decisive)
                 return
 
         self.matches = self.catalog.search_cards(

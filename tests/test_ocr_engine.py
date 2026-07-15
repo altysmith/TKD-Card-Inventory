@@ -254,6 +254,85 @@ class CardOCREngineTests(unittest.TestCase):
         self.assertEqual("57/142", narrowed[0]["number"])
         self.assertEqual(1, len(narrowed))
 
+    def test_regulation_mark_narrows_exact_title_candidates(self) -> None:
+        cards = [
+            {
+                "name": "Slowpoke",
+                "set_code": "SCR",
+                "raw_number": "57",
+                "number": "57/142",
+                "printed_total": 142,
+                "regulation_mark": "H",
+            },
+            {
+                "name": "Slowpoke",
+                "set_code": "PRE",
+                "raw_number": "18",
+                "number": "18/131",
+                "printed_total": 131,
+                "regulation_mark": "H",
+            },
+            {
+                "name": "Slowpoke",
+                "set_code": "MEW",
+                "raw_number": "79",
+                "number": "79/165",
+                "printed_total": 165,
+                "regulation_mark": "G",
+            },
+        ]
+
+        narrowed, _used_set = self.engine.narrow_exact_name_candidates(
+            cards,
+            "Slowpoke",
+            regulation_mark="H",
+            trust_set_hint=False,
+        )
+
+        self.assertEqual(["SCR", "PRE"], [card["set_code"] for card in narrowed])
+
+    def test_posted_number_fragments_resolve_scr_after_regulation_filter(self) -> None:
+        cards = [
+            {
+                "name": "Slowpoke",
+                "set_name": "Prismatic Evolutions",
+                "set_code": "PRE",
+                "raw_number": "18",
+                "number": "18/131",
+                "printed_total": 131,
+                "regulation_mark": "H",
+            },
+            {
+                "name": "Slowpoke",
+                "set_name": "Stellar Crown",
+                "set_code": "SCR",
+                "raw_number": "57",
+                "number": "57/142",
+                "printed_total": 142,
+                "regulation_mark": "H",
+            },
+        ]
+        number_hints = (("0372", 36.0), ("664", 16.0))
+
+        ranked = self.engine.rank_number_fragment_candidates(cards, number_hints)
+
+        self.assertEqual("SCR", ranked[0]["set_code"])
+        self.assertTrue(
+            self.engine.decisive_number_fragment_match(ranked, number_hints)
+        )
+
+    def test_regulation_picker_uses_strongest_single_letter(self) -> None:
+        mark, confidence = self.engine._best_regulation_attempt(
+            [
+                ("I", 12.0, "regulation"),
+                ("H", 99.8, "regulation"),
+                ("SCR", 90.0, "regulation"),
+            ]
+        )
+
+        self.assertEqual("H", mark)
+        self.assertEqual(99.8, confidence)
+
     def test_title_picker_ignores_layout_labels(self) -> None:
         title, confidence = self.engine._best_title_attempt(
             [

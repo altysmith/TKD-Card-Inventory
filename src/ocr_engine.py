@@ -31,7 +31,10 @@ class OCRResult:
     card_name_confidence: float = 0.0
     set_code: str = ""
     set_code_confidence: float = 0.0
+    regulation_mark: str = ""
+    regulation_mark_confidence: float = 0.0
     collector_number: str = ""
+    number_hints: tuple[tuple[str, float], ...] = ()
     printed_total: int | None = None
     confidence: int = 0
     raw_text: str = ""
@@ -51,6 +54,7 @@ class CardOCREngine:
     SET_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     NUMBER_ALLOWLIST = "0123456789/"
     TITLE_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-' ."
+    REGULATION_ALLOWLIST = "DEFGHI"
     _easy_reader: Any = None
     _easy_error: str = ""
 
@@ -212,6 +216,14 @@ class CardOCREngine:
         )
 
     @staticmethod
+    def _regulation_region(identifier: Any) -> Any:
+        height, width = identifier.shape[:2]
+        return identifier[
+            int(height * 0.05) : int(height * 0.90),
+            int(width * 0.02) : int(width * 0.18),
+        ].copy()
+
+    @staticmethod
     def _prepare(image: Any, scale: float, threshold: bool = False) -> Any:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         enlarged = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
@@ -354,6 +366,18 @@ class CardOCREngine:
             return "", 0.0
         _rank, text, confidence = max(candidates, key=lambda item: item[0])
         return text, confidence
+
+    @classmethod
+    def _best_regulation_attempt(
+        cls, attempts: list[tuple[str, float, str]]
+    ) -> tuple[str, float]:
+        candidates = [
+            (text.strip().upper(), float(confidence))
+            for text, confidence, _source in attempts
+            if len(text.strip()) == 1
+            and text.strip().upper() in cls.REGULATION_ALLOWLIST
+        ]
+        return max(candidates, key=lambda item: item[1]) if candidates else ("", 0.0)
 
     @staticmethod
     def _numeric_normalize(text: str) -> str:
@@ -602,6 +626,7 @@ class CardOCREngine:
         collector_hint: str = "",
         printed_total: int | None = None,
         trust_set_hint: bool = True,
+        regulation_mark: str = "",
     ) -> tuple[list[dict[str, Any]], bool]:
         """Let an exact title establish identity before optional identifier clues."""
         candidates = [
@@ -641,6 +666,16 @@ class CardOCREngine:
             if number_matches:
                 candidates = number_matches
 
+        if regulation_mark:
+            regulation_matches = [
+                card
+                for card in candidates
+                if str(card.get("regulation_mark", "")).upper()
+                == regulation_mark.upper()
+            ]
+            if regulation_matches:
+                candidates = regulation_matches
+
         if printed_total is not None:
             total_matches = [
                 card
@@ -651,6 +686,67 @@ class CardOCREngine:
                 candidates = total_matches
 
         return candidates, used_set_hint
+
+    @classmethod
+    def number_fragment_score(
+        cls, card: dict[str, Any], hints: tuple[tuple[str, float], ...]
+    ) -> float:
+        raw_number = re.sub(
+            r"\D", "", str(card.get("raw_number", card.get("number", ""))).split("/", 1)[0]
+        )
+        printed_total = re.sub(r"\D", "", str(card.get("printed_total") or ""))
+        variants: set[str] = set()
+        if raw_number:
+            variants.update({raw_number, raw_number.zfill(3)})
+        if printed_total:
+            variants.update({printed_total, printed_total.zfill(3)})
+        if raw_number and printed_total:
+            variants.update(
+                {
+                    raw_number + printed_total,
+                    raw_number.zfill(3) + printed_total.zfill(3),
+                }
+            )
+        evidence: list[float] = []
+        for hint, confidence in hints:
+            digits = re.sub(r"\D", "", hint)
+            if len(digits) < 3 or not variants:
+                continue
+            similarity = max(
+                SequenceMatcher(None, digits, variant).ratio()
+                for variant in variants
+            )
+            length_weight = min(1.0, len(digits) / 4.0)
+            confidence_weight = 0.65 + min(100.0, confidence) / 285.0
+            evidence.append(similarity * length_weight * confidence_weight)
+        return sum(sorted(evidence, reverse=True)[:2])
+
+    @classmethod
+    def rank_number_fragment_candidates(
+        cls,
+        cards: list[dict[str, Any]],
+        hints: tuple[tuple[str, float], ...],
+    ) -> list[dict[str, Any]]:
+        return sorted(
+            cards,
+            key=lambda card: (
+                -cls.number_fragment_score(card, hints),
+                str(card.get("set_name", "")).casefold(),
+                str(card.get("number", "")),
+            ),
+        )
+
+    @classmethod
+    def decisive_number_fragment_match(
+        cls,
+        cards: list[dict[str, Any]],
+        hints: tuple[tuple[str, float], ...],
+    ) -> bool:
+        if not cards or len(cards) > 5:
+            return False
+        best = cls.number_fragment_score(cards[0], hints)
+        second = cls.number_fragment_score(cards[1], hints) if len(cards) > 1 else 0.0
+        return best >= 0.50 and best - second >= 0.20
 
     @classmethod
     def capture_frame_score(cls, frame: Any, mode: str) -> float:
@@ -705,9 +801,14 @@ class CardOCREngine:
         value = 255 if len(image.shape) == 2 else (0, 255, 0)
         return cv2.copyMakeBorder(image, 5, 5, 5, 5, cv2.BORDER_CONSTANT, value=value)
 
-    def read_card(self, frame: Any, mode: str = "full", enhanced: bool = False) -> OCRResult:
+    def read_card(
+        self, frame: Any, mode: str = "full", enhanced: bool = False
+    ) -> OCRResult:
         if not self.available():
-            raise RuntimeError("No OCR engine is installed. Run pip install -r requirements.txt and restart the app.")
+            raise RuntimeError(
+                "No OCR engine is installed. Run pip install -r requirements.txt "
+                "and restart the app."
+            )
 
         started = time.perf_counter()
         guided_area = self.crop_guided_area(frame, mode)
@@ -716,6 +817,7 @@ class CardOCREngine:
         identifier = self._identifier_strip(area, mode)
         title_region = self._title_region(area, mode)
         set_region, number_region = self._identifier_regions(identifier)
+        regulation_region = self._regulation_region(identifier)
         gray_identifier = cv2.cvtColor(identifier, cv2.COLOR_BGR2GRAY)
         sharpness = float(cv2.Laplacian(gray_identifier, cv2.CV_64F).var())
         capture_quality = self._capture_quality(identifier, sharpness)
@@ -727,6 +829,9 @@ class CardOCREngine:
         set_binary = self._prepare(set_region, target_scale, threshold=True)
         number_processed = self._prepare(number_region, target_scale, threshold=False)
         number_binary = self._prepare(number_region, target_scale, threshold=True)
+        regulation_binary = self._prepare(
+            regulation_region, target_scale, threshold=True
+        )
         title_processed = (
             self._prepare(title_region, 4.0 if enhanced else 3.0, threshold=False)
             if title_region is not None and title_region.size
@@ -740,6 +845,7 @@ class CardOCREngine:
 
         attempts: list[tuple[str, float, str]] = []
         title_attempts: list[tuple[str, float, str]] = []
+        regulation_attempts: list[tuple[str, float, str]] = []
         backend_lines: list[str] = []
 
         def add_attempts(source: str, found: list[tuple[str, float]]) -> None:
@@ -758,6 +864,12 @@ class CardOCREngine:
             add_attempts(
                 "EasyOCR number binary",
                 self._easy_read(reader, number_binary, self.NUMBER_ALLOWLIST),
+            )
+            regulation_attempts.extend(
+                (text, score, "EasyOCR regulation binary")
+                for text, score in self._easy_read(
+                    reader, regulation_binary, self.REGULATION_ALLOWLIST
+                )
             )
             if title_processed is not None and title_binary is not None:
                 title_attempts.extend(
@@ -789,7 +901,9 @@ class CardOCREngine:
                         self.NUMBER_ALLOWLIST,
                     ),
                 )
-            backend_lines.append("Primary engine: EasyOCR (title, full, set, and number regions)")
+            backend_lines.append(
+                "Primary engine: EasyOCR (title, regulation, full, set, and number regions)"
+            )
         elif self._easy_error:
             backend_lines.append(f"EasyOCR unavailable: {self._easy_error}")
 
@@ -849,6 +963,15 @@ class CardOCREngine:
             else 0.0
         )
         card_name, card_name_confidence = self._best_title_attempt(title_attempts)
+        regulation_mark, regulation_mark_confidence = self._best_regulation_attempt(
+            regulation_attempts
+        )
+        number_hints = tuple(
+            (re.sub(r"\D", "", self._numeric_normalize(text)), score)
+            for text, score, source in attempts
+            if "number" in source.casefold()
+            and len(re.sub(r"\D", "", self._numeric_normalize(text))) >= 3
+        )
         texts = [text for text, _score, _source in attempts if text]
         evidence = self._text_evidence(texts)
 
@@ -869,16 +992,29 @@ class CardOCREngine:
                 )
             )
         elif set_code:
-            confidence = max(55, int(round(matched_confidence * 0.60 + capture_quality * 0.40)))
+            confidence = max(
+                55,
+                int(round(matched_confidence * 0.60 + capture_quality * 0.40)),
+            )
         else:
-            confidence = min(72, int(round(capture_quality * 0.40 + evidence * 0.40 + matched_confidence * 0.20)))
+            confidence = min(
+                72,
+                int(
+                    round(
+                        capture_quality * 0.40
+                        + evidence * 0.40
+                        + matched_confidence * 0.20
+                    )
+                ),
+            )
 
         elapsed = int(round((time.perf_counter() - started) * 1000))
         raw_lines = [
             f"Capture quality: {capture_quality}%",
             f"Identifier evidence: {evidence}%",
             f"Card alignment: {'perspective corrected' if perspective_corrected else 'fixed guide'}",
-            "Recognition strategy: title, set-code, and collector-number OCR, then catalog resolution",
+            "Recognition strategy: title, regulation, set-code, and collector-number OCR, "
+            "then catalog resolution",
             *backend_lines,
             "OCR attempts:",
         ]
@@ -890,7 +1026,12 @@ class CardOCREngine:
             f"  {len(attempts) + index + 1}: [{source}] {text or '<nothing>'} ({score:.0f}%)"
             for index, (text, score, source) in enumerate(title_attempts)
         )
-        if not attempts and not title_attempts:
+        raw_lines.extend(
+            f"  {len(attempts) + len(title_attempts) + index + 1}: "
+            f"[{source}] {text or '<nothing>'} ({score:.0f}%)"
+            for index, (text, score, source) in enumerate(regulation_attempts)
+        )
+        if not attempts and not title_attempts and not regulation_attempts:
             raw_lines.append("  <nothing>")
 
         return OCRResult(
@@ -898,7 +1039,10 @@ class CardOCREngine:
             card_name_confidence=card_name_confidence,
             set_code=set_code,
             set_code_confidence=set_code_confidence,
+            regulation_mark=regulation_mark,
+            regulation_mark_confidence=regulation_mark_confidence,
             collector_number=collector_number,
+            number_hints=number_hints,
             printed_total=printed_total,
             confidence=max(0, min(100, confidence)),
             raw_text="\n".join(raw_lines),
