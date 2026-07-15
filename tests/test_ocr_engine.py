@@ -189,6 +189,71 @@ class CardOCREngineTests(unittest.TestCase):
             )
         )
 
+    def test_exact_title_ignores_conflicting_set_and_keeps_same_name(self) -> None:
+        cards = [
+            {
+                "name": "Slowpoke",
+                "set_code": "SCR",
+                "raw_number": "57",
+                "number": "57/142",
+                "printed_total": 142,
+            },
+            {
+                "name": "Slowpoke",
+                "set_code": "MEW",
+                "raw_number": "79",
+                "number": "79/165",
+                "printed_total": 165,
+            },
+            {
+                "name": "Spoink",
+                "set_code": "FCO",
+                "raw_number": "30",
+                "number": "30/124",
+                "printed_total": 124,
+            },
+        ]
+
+        narrowed, used_set = self.engine.narrow_exact_name_candidates(
+            cards,
+            "Slowpoke",
+            set_hint="FCO",
+            trust_set_hint=False,
+        )
+
+        self.assertFalse(used_set)
+        self.assertEqual(["Slowpoke", "Slowpoke"], [card["name"] for card in narrowed])
+        self.assertNotIn("Spoink", [card["name"] for card in narrowed])
+
+    def test_exact_title_uses_matching_set_as_secondary_evidence(self) -> None:
+        cards = [
+            {
+                "name": "Slowpoke",
+                "set_code": "SCR",
+                "raw_number": "57",
+                "number": "57/142",
+                "printed_total": 142,
+            },
+            {
+                "name": "Slowpoke",
+                "set_code": "MEW",
+                "raw_number": "79",
+                "number": "79/165",
+                "printed_total": 165,
+            },
+        ]
+
+        narrowed, used_set = self.engine.narrow_exact_name_candidates(
+            cards,
+            "Slowpoke",
+            set_hint="SCR",
+            trust_set_hint=True,
+        )
+
+        self.assertTrue(used_set)
+        self.assertEqual("57/142", narrowed[0]["number"])
+        self.assertEqual(1, len(narrowed))
+
     def test_title_picker_ignores_layout_labels(self) -> None:
         title, confidence = self.engine._best_title_attempt(
             [

@@ -470,7 +470,9 @@ class ScannerTab(QWidget):
             f"time: {result.processing_ms} ms",
         ]
         if result.set_code:
-            details.append(f"set: {result.set_code}")
+            details.append(
+                f"set: {result.set_code} ({result.set_code_confidence:.0f}%)"
+            )
         if result.card_name:
             details.append(
                 f"title: {result.card_name} ({result.card_name_confidence:.0f}%)"
@@ -482,12 +484,14 @@ class ScannerTab(QWidget):
             details.append(f"number: {number}")
         self.ocr_status.setText(" • ".join(details))
 
-        if result.set_code or result.collector_number:
+        if result.set_code or result.collector_number or result.card_name:
             self.find_matches(
                 printed_total=result.printed_total,
                 fuzzy_name_hint=(
                     result.card_name if result.card_name_confidence >= 30.0 else ""
                 ),
+                prefer_name=result.card_name_confidence >= 30.0,
+                trust_set_hint=result.set_code_confidence >= 40.0,
             )
 
         threshold = int(self.settings.value("scanner/confidence", 90))
@@ -537,6 +541,8 @@ class ScannerTab(QWidget):
         self,
         printed_total: int | None = None,
         fuzzy_name_hint: str = "",
+        prefer_name: bool = False,
+        trust_set_hint: bool = True,
     ) -> None:
         name = self.card_name_input.text().strip()
         set_query = self.set_input.text().strip()
@@ -551,6 +557,48 @@ class ScannerTab(QWidget):
                 self, "Identify card", "Enter a set acronym, number, or card name."
             )
             return
+
+        title_hint = fuzzy_name_hint or name
+        if prefer_name and title_hint:
+            title_candidates = self.catalog.search_cards(
+                name=title_hint,
+                limit=500,
+            )
+            title_candidates, used_set_hint = self.ocr.narrow_exact_name_candidates(
+                title_candidates,
+                title_hint,
+                set_hint=set_query,
+                collector_hint=number,
+                printed_total=printed_total,
+                trust_set_hint=trust_set_hint,
+            )
+            if title_candidates:
+                self.matches = title_candidates
+                ignored_set_hint = bool(set_query and not used_set_hint)
+                if ignored_set_hint:
+                    ignored_code = set_query
+                    self.set_input.clear()
+                    self.ocr_status.setText(
+                        self.ocr_status.text()
+                        + f" | Ignored conflicting set guess {ignored_code}"
+                    )
+                if len(self.matches) == 1:
+                    card = self.matches[0]
+                    self.card_name_input.setText(str(card.get("name", title_hint)))
+                    self.set_input.setText(str(card.get("set_code", "")))
+                    self.number_input.setText(str(card.get("number", "")))
+                    self.ocr_status.setText(
+                        self.ocr_status.text()
+                        + f" | Catalog resolved {card.get('name', title_hint)} "
+                        + f"{card.get('set_code', '')} {card.get('number', '')}"
+                    )
+                else:
+                    self.ocr_status.setText(
+                        self.ocr_status.text()
+                        + f" | Exact title found; {len(self.matches)} prints need set or number confirmation"
+                    )
+                self._populate_matches_table(select_first=len(self.matches) == 1)
+                return
 
         self.matches = self.catalog.search_cards(
             name=name,
@@ -602,7 +650,6 @@ class ScannerTab(QWidget):
             used_relaxed_identifier_match = bool(self.matches)
 
         used_title_resolution = False
-        title_hint = fuzzy_name_hint or name
         if not self.matches and title_hint and set_query:
             # A title such as SWPKE can still identify Slowpoke when SCR has
             # one clearly superior catalog candidate. Do not require OCR to
@@ -674,6 +721,9 @@ class ScannerTab(QWidget):
                     self.ocr_status.text()
                     + f" | Catalog resolved {best_code} {self.matches[0].get('number', number)}"
                 )
+        self._populate_matches_table()
+
+    def _populate_matches_table(self, select_first: bool = True) -> None:
         self.matches_table.setRowCount(len(self.matches))
         for row, card in enumerate(self.matches):
             values = [
@@ -689,8 +739,10 @@ class ScannerTab(QWidget):
                     row, column, QTableWidgetItem(str(value))
                 )
         self.matches_table.resizeColumnsToContents()
-        if self.matches:
+        if self.matches and select_first:
             self.matches_table.selectRow(0)
+        else:
+            self.matches_table.clearSelection()
 
     def add_to_queue(self) -> None:
         row = self.matches_table.currentRow()

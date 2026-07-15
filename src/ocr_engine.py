@@ -30,6 +30,7 @@ class OCRResult:
     card_name: str = ""
     card_name_confidence: float = 0.0
     set_code: str = ""
+    set_code_confidence: float = 0.0
     collector_number: str = ""
     printed_total: int | None = None
     confidence: int = 0
@@ -593,6 +594,65 @@ class CardOCREngine:
         )
 
     @classmethod
+    def narrow_exact_name_candidates(
+        cls,
+        cards: list[dict[str, Any]],
+        name_hint: str,
+        set_hint: str = "",
+        collector_hint: str = "",
+        printed_total: int | None = None,
+        trust_set_hint: bool = True,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Let an exact title establish identity before optional identifier clues."""
+        candidates = [
+            card
+            for card in cards
+            if cls.name_similarity(name_hint, str(card.get("name", ""))) == 1.0
+        ]
+        if not candidates:
+            return [], False
+
+        used_set_hint = False
+        if set_hint and trust_set_hint:
+            set_matches = [
+                card
+                for card in candidates
+                if cls.set_code_similarity(
+                    set_hint, str(card.get("set_code", ""))
+                )
+                == 1.0
+            ]
+            if set_matches:
+                candidates = set_matches
+                used_set_hint = True
+
+        if collector_hint:
+            expected = re.sub(r"\D", "", collector_hint.split("/", 1)[0])
+            number_matches = [
+                card
+                for card in candidates
+                if re.sub(
+                    r"\D",
+                    "",
+                    str(card.get("raw_number", card.get("number", ""))).split("/", 1)[0],
+                )
+                == expected
+            ]
+            if number_matches:
+                candidates = number_matches
+
+        if printed_total is not None:
+            total_matches = [
+                card
+                for card in candidates
+                if card.get("printed_total") == printed_total
+            ]
+            if total_matches:
+                candidates = total_matches
+
+        return candidates, used_set_hint
+
+    @classmethod
     def capture_frame_score(cls, frame: Any, mode: str) -> float:
         """Prefer readable identifier/title regions and penalize clipped glare."""
         area = cls.crop_guided_area(frame, mode)
@@ -776,6 +836,18 @@ class CardOCREngine:
         parsed = self._parse_attempts(attempts)
 
         set_code, collector_number, printed_total, matched_text, matched_confidence = parsed
+        set_code_confidence = (
+            max(
+                (
+                    score
+                    for text, score, source in attempts
+                    if self._extract_set_code(text, source) == set_code
+                ),
+                default=0.0,
+            )
+            if set_code
+            else 0.0
+        )
         card_name, card_name_confidence = self._best_title_attempt(title_attempts)
         texts = [text for text, _score, _source in attempts if text]
         evidence = self._text_evidence(texts)
@@ -825,6 +897,7 @@ class CardOCREngine:
             card_name=card_name,
             card_name_confidence=card_name_confidence,
             set_code=set_code,
+            set_code_confidence=set_code_confidence,
             collector_number=collector_number,
             printed_total=printed_total,
             confidence=max(0, min(100, confidence)),
