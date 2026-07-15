@@ -115,6 +115,95 @@ class CardOCREngineTests(unittest.TestCase):
 
         self.assertEqual("BLK", ranked[0]["set_code"])
 
+    def test_damaged_title_resolves_slowpoke_inside_scr(self) -> None:
+        cards = [
+            {
+                "name": "Alcremie",
+                "set_name": "Stellar Crown",
+                "set_code": "SCR",
+                "raw_number": "65",
+                "number": "65/142",
+                "printed_total": 142,
+            },
+            {
+                "name": "Slowpoke",
+                "set_name": "Stellar Crown",
+                "set_code": "SCR",
+                "raw_number": "57",
+                "number": "57/142",
+                "printed_total": 142,
+            },
+            {
+                "name": "Sparkling Crystal",
+                "set_name": "Stellar Crown",
+                "set_code": "SCR",
+                "raw_number": "142",
+                "number": "142/142",
+                "printed_total": 142,
+            },
+        ]
+
+        ranked = self.engine.rank_catalog_candidates(
+            cards, "SCR", name_hint="SWPKE"
+        )
+
+        self.assertEqual("Slowpoke", ranked[0]["name"])
+        self.assertTrue(
+            self.engine.decisive_title_match(ranked, "SCR", "SWPKE")
+        )
+
+    def test_ambiguous_title_is_not_declared_decisive(self) -> None:
+        cards = [
+            {"name": "Mew ex", "set_code": "MEW", "number": "151/165"},
+            {"name": "Mew ex", "set_code": "MEW", "number": "193/165"},
+        ]
+        ranked = self.engine.rank_catalog_candidates(
+            cards, "MEW", name_hint="MEWEX"
+        )
+
+        self.assertFalse(self.engine.decisive_title_match(ranked, "MEW", "MEWEX"))
+
+    def test_collector_number_breaks_a_duplicate_title_tie(self) -> None:
+        cards = [
+            {
+                "name": "Mew ex",
+                "set_code": "MEW",
+                "raw_number": "151",
+                "number": "151/165",
+            },
+            {
+                "name": "Mew ex",
+                "set_code": "MEW",
+                "raw_number": "193",
+                "number": "193/165",
+            },
+        ]
+        ranked = self.engine.rank_catalog_candidates(
+            cards, "MEW", name_hint="MEWEX", collector_hint="193"
+        )
+
+        self.assertEqual("193", ranked[0]["raw_number"])
+        self.assertTrue(
+            self.engine.decisive_catalog_match(
+                ranked, "MEW", "MEWEX", collector_hint="193"
+            )
+        )
+
+    def test_title_picker_ignores_layout_labels(self) -> None:
+        title, confidence = self.engine._best_title_attempt(
+            [
+                ("BASIC", 99.0, "title"),
+                ("SWPKE", 92.0, "title"),
+                ("HP", 98.0, "title"),
+            ]
+        )
+
+        self.assertEqual("SWPKE", title)
+        self.assertEqual(92.0, confidence)
+
+    def test_title_region_avoids_right_side_hp_area(self) -> None:
+        self.assertEqual((70, 25, 800, 203), self.engine._title_region_bounds(1000, 1400))
+
     def test_failed_easyocr_variant_does_not_abort_other_attempts(self) -> None:
         class BrokenReader:
             def readtext(self, *_args, **_kwargs):

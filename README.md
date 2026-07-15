@@ -11,6 +11,9 @@ Desktop Pokémon card inventory application built with Python, PySide6, SQLite, 
 - Automatically increment duplicate quantities
 - View current inventory
 - Export inventory to CSV or Excel
+- Live webcam capture with burst-frame quality selection
+- Local title, set-code, and collector-number OCR
+- Catalog-aware correction of incomplete or damaged OCR text
 
 ## Setup
 
@@ -45,10 +48,13 @@ python -m src.main
 
 The application stores its SQLite inventory database in the user's local application-data directory, not inside the Git repository. Exported CSV and Excel files are written to a folder selected by the user.
 
-## Planned next steps
+## Scanner design
 
-- Image upload and card cropping
-- OCR-assisted name and collector-number recognition
-- Live webcam capture
-- Scan-session history and undo
-- Improved matching and confidence scoring
+The scanner works offline after the catalog is downloaded. It straightens a
+detected card, reads independent title and identifier regions, and ranks local
+catalog candidates using all available evidence. A result is collapsed to one
+card only when the leading candidate is sufficiently separated from the
+runner-up; ambiguous prints remain available for manual review.
+
+Foil glare can still obscure printed details. A fixed camera position with
+soft, diffuse lighting gives the most repeatable results.

@@ -6,9 +6,11 @@ import shutil
 import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from math import log1p
 from typing import Any
 
 import cv2
+import numpy as np
 
 try:
     import easyocr
@@ -26,6 +28,7 @@ except ImportError:  # pragma: no cover
 @dataclass
 class OCRResult:
     card_name: str = ""
+    card_name_confidence: float = 0.0
     set_code: str = ""
     collector_number: str = ""
     printed_total: int | None = None
@@ -38,7 +41,7 @@ class OCRResult:
 
 
 class CardOCREngine:
-    """Read a modern card's printed set code and collector fraction."""
+    """Read card identity clues and reconcile them with the local catalog."""
 
     CARD_ASPECT_RATIO = 0.714
     SET_CODE = re.compile(r"(?<![A-Z])([A-Z]{3})(?![A-Z])")
@@ -46,6 +49,7 @@ class CardOCREngine:
     MIXED_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/"
     SET_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     NUMBER_ALLOWLIST = "0123456789/"
+    TITLE_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-' ."
     _easy_reader: Any = None
     _easy_error: str = ""
 
@@ -78,6 +82,88 @@ class CardOCREngine:
         left = max(0, (width - guide_width) // 2)
         top = max(0, (height - guide_height) // 2)
         return frame[top : top + guide_height, left : left + guide_width].copy()
+
+    @staticmethod
+    def _order_corners(points: Any) -> Any:
+        ordered = np.zeros((4, 2), dtype="float32")
+        coordinate_sums = points.sum(axis=1)
+        coordinate_differences = np.diff(points, axis=1).reshape(-1)
+        ordered[0] = points[np.argmin(coordinate_sums)]
+        ordered[2] = points[np.argmax(coordinate_sums)]
+        ordered[1] = points[np.argmin(coordinate_differences)]
+        ordered[3] = points[np.argmax(coordinate_differences)]
+        return ordered
+
+    @classmethod
+    def normalize_card_area(cls, area: Any, mode: str) -> Any:
+        """Straighten a full-card capture when a credible card outline is visible."""
+        if mode == "identifier" or area is None or area.size == 0:
+            return area
+
+        height, width = area.shape[:2]
+        gray = cv2.cvtColor(area, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 45, 135)
+        edges = cv2.morphologyEx(
+            edges, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8)
+        )
+        contours, _hierarchy = cv2.findContours(
+            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        frame_area = float(width * height)
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:8]:
+            contour_area = float(cv2.contourArea(contour))
+            if contour_area < frame_area * 0.38:
+                break
+            perimeter = cv2.arcLength(contour, True)
+            corners = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
+            if len(corners) != 4 or not cv2.isContourConvex(corners):
+                continue
+
+            ordered = cls._order_corners(corners.reshape(4, 2).astype("float32"))
+            top_width = np.linalg.norm(ordered[1] - ordered[0])
+            bottom_width = np.linalg.norm(ordered[2] - ordered[3])
+            left_height = np.linalg.norm(ordered[3] - ordered[0])
+            right_height = np.linalg.norm(ordered[2] - ordered[1])
+            measured_width = max(top_width, bottom_width)
+            measured_height = max(left_height, right_height)
+            if measured_height <= 0:
+                continue
+            measured_ratio = measured_width / measured_height
+            if not 0.58 <= measured_ratio <= 0.84:
+                continue
+
+            target_height = max(400, int(round(measured_height)))
+            target_width = max(286, int(round(target_height * cls.CARD_ASPECT_RATIO)))
+            destination = np.array(
+                [
+                    [0, 0],
+                    [target_width - 1, 0],
+                    [target_width - 1, target_height - 1],
+                    [0, target_height - 1],
+                ],
+                dtype="float32",
+            )
+            transform = cv2.getPerspectiveTransform(ordered, destination)
+            return cv2.warpPerspective(area, transform, (target_width, target_height))
+        return area
+
+    @staticmethod
+    def _title_region_bounds(width: int, height: int) -> tuple[int, int, int, int]:
+        return (
+            int(width * 0.07),
+            int(height * 0.018),
+            max(1, int(width * 0.80)),
+            max(1, int(height * 0.145)),
+        )
+
+    @classmethod
+    def _title_region(cls, area: Any, mode: str) -> Any | None:
+        if mode == "identifier":
+            return None
+        height, width = area.shape[:2]
+        left, top, right, bottom = cls._title_region_bounds(width, height)
+        return area[top:bottom, left:right].copy()
 
     @staticmethod
     def _identifier_strip(area: Any, mode: str) -> Any:
@@ -247,6 +333,28 @@ class CardOCREngine:
         return re.sub(r"\s+", " ", normalized).strip()
 
     @staticmethod
+    def _normalize_name(text: str) -> str:
+        return re.sub(r"[^A-Z0-9]", "", text.upper())
+
+    @classmethod
+    def _best_title_attempt(
+        cls, attempts: list[tuple[str, float, str]]
+    ) -> tuple[str, float]:
+        ignored = {"BASIC", "STAGE", "TRAINER", "ITEM", "HP"}
+        candidates: list[tuple[float, str, float]] = []
+        for text, confidence, _source in attempts:
+            clean = re.sub(r"\s+", " ", text).strip(" .-'\t\r\n")
+            normalized = cls._normalize_name(clean)
+            if len(normalized) < 3 or normalized in ignored or normalized.isdigit():
+                continue
+            rank = float(confidence) + min(15, len(normalized)) * 1.5
+            candidates.append((rank, clean, float(confidence)))
+        if not candidates:
+            return "", 0.0
+        _rank, text, confidence = max(candidates, key=lambda item: item[0])
+        return text, confidence
+
+    @staticmethod
     def _numeric_normalize(text: str) -> str:
         normalized = text.upper().replace("|", "/").replace("\\", "/")
         normalized = re.sub(r"\s+", "", normalized)
@@ -373,18 +481,133 @@ class CardOCREngine:
         return SequenceMatcher(None, hint, code).ratio()
 
     @classmethod
+    def name_similarity(cls, name_hint: str, card_name: str) -> float:
+        hint = cls._normalize_name(name_hint)
+        name = cls._normalize_name(card_name)
+        if not hint or not name:
+            return 0.0
+        if hint == name:
+            return 1.0
+        return SequenceMatcher(None, hint, name).ratio()
+
+    @classmethod
+    def catalog_candidate_score(
+        cls,
+        card: dict[str, Any],
+        set_hint: str = "",
+        name_hint: str = "",
+        collector_hint: str = "",
+        printed_total: int | None = None,
+    ) -> float:
+        score = 0.0
+        if set_hint:
+            score += cls.set_code_similarity(
+                set_hint, str(card.get("set_code", ""))
+            ) * 25.0
+        if name_hint:
+            score += cls.name_similarity(name_hint, str(card.get("name", ""))) * 60.0
+        if collector_hint:
+            expected = re.sub(r"\D", "", collector_hint.split("/", 1)[0])
+            actual = re.sub(
+                r"\D", "", str(card.get("raw_number", card.get("number", ""))).split("/", 1)[0]
+            )
+            score += 12.0 if expected and expected == actual else -2.0
+        if printed_total is not None:
+            score += 5.0 if card.get("printed_total") == printed_total else -1.0
+        return score
+
+    @classmethod
     def rank_catalog_candidates(
-        cls, cards: list[dict[str, Any]], set_hint: str
+        cls,
+        cards: list[dict[str, Any]],
+        set_hint: str,
+        name_hint: str = "",
+        collector_hint: str = "",
+        printed_total: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Put catalog set codes closest to the OCR hint first."""
+        """Rank catalog rows using every independent clue that OCR recovered."""
         return sorted(
             cards,
             key=lambda card: (
-                -cls.set_code_similarity(set_hint, str(card.get("set_code", ""))),
+                -cls.catalog_candidate_score(
+                    card,
+                    set_hint=set_hint,
+                    name_hint=name_hint,
+                    collector_hint=collector_hint,
+                    printed_total=printed_total,
+                ),
                 str(card.get("name", "")).casefold(),
                 str(card.get("set_name", "")).casefold(),
             ),
         )
+
+    @classmethod
+    def decisive_title_match(
+        cls, cards: list[dict[str, Any]], set_hint: str, name_hint: str
+    ) -> bool:
+        """Require a strong title match with separation from the runner-up."""
+        if not cards or not set_hint or not name_hint:
+            return False
+        best_set = cls.set_code_similarity(set_hint, str(cards[0].get("set_code", "")))
+        best_name = cls.name_similarity(name_hint, str(cards[0].get("name", "")))
+        second_name = (
+            cls.name_similarity(name_hint, str(cards[1].get("name", "")))
+            if len(cards) > 1
+            else 0.0
+        )
+        return best_set >= 0.80 and best_name >= 0.62 and best_name - second_name >= 0.10
+
+    @classmethod
+    def decisive_catalog_match(
+        cls,
+        cards: list[dict[str, Any]],
+        set_hint: str,
+        name_hint: str,
+        collector_hint: str = "",
+    ) -> bool:
+        if cls.decisive_title_match(cards, set_hint, name_hint):
+            return True
+        if not cards or not set_hint or not name_hint or not collector_hint:
+            return False
+        expected = re.sub(r"\D", "", collector_hint.split("/", 1)[0])
+        best_actual = re.sub(
+            r"\D",
+            "",
+            str(cards[0].get("raw_number", cards[0].get("number", ""))).split("/", 1)[0],
+        )
+        second_actual = (
+            re.sub(
+                r"\D",
+                "",
+                str(cards[1].get("raw_number", cards[1].get("number", ""))).split("/", 1)[0],
+            )
+            if len(cards) > 1
+            else ""
+        )
+        return (
+            cls.set_code_similarity(set_hint, str(cards[0].get("set_code", ""))) >= 0.80
+            and cls.name_similarity(name_hint, str(cards[0].get("name", ""))) >= 0.45
+            and bool(expected)
+            and best_actual == expected
+            and second_actual != expected
+        )
+
+    @classmethod
+    def capture_frame_score(cls, frame: Any, mode: str) -> float:
+        """Prefer readable identifier/title regions and penalize clipped glare."""
+        area = cls.crop_guided_area(frame, mode)
+        regions = [cls._identifier_strip(area, mode)]
+        title = cls._title_region(area, mode)
+        if title is not None and title.size:
+            regions.append(title)
+        scores: list[float] = []
+        for region in regions:
+            gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+            sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            contrast = float(gray.std())
+            clipped = float(np.count_nonzero(gray >= 250)) / float(gray.size)
+            scores.append(log1p(sharpness) * 25.0 + contrast - clipped * 420.0)
+        return sum(scores) / len(scores)
 
     @staticmethod
     def _capture_quality(image: Any, sharpness: float) -> int:
@@ -427,8 +650,11 @@ class CardOCREngine:
             raise RuntimeError("No OCR engine is installed. Run pip install -r requirements.txt and restart the app.")
 
         started = time.perf_counter()
-        area = self.crop_guided_area(frame, mode)
+        guided_area = self.crop_guided_area(frame, mode)
+        area = self.normalize_card_area(guided_area, mode)
+        perspective_corrected = area is not guided_area
         identifier = self._identifier_strip(area, mode)
+        title_region = self._title_region(area, mode)
         set_region, number_region = self._identifier_regions(identifier)
         gray_identifier = cv2.cvtColor(identifier, cv2.COLOR_BGR2GRAY)
         sharpness = float(cv2.Laplacian(gray_identifier, cv2.CV_64F).var())
@@ -441,8 +667,19 @@ class CardOCREngine:
         set_binary = self._prepare(set_region, target_scale, threshold=True)
         number_processed = self._prepare(number_region, target_scale, threshold=False)
         number_binary = self._prepare(number_region, target_scale, threshold=True)
+        title_processed = (
+            self._prepare(title_region, 4.0 if enhanced else 3.0, threshold=False)
+            if title_region is not None and title_region.size
+            else None
+        )
+        title_binary = (
+            self._prepare(title_region, 4.0 if enhanced else 3.0, threshold=True)
+            if title_region is not None and title_region.size
+            else None
+        )
 
         attempts: list[tuple[str, float, str]] = []
+        title_attempts: list[tuple[str, float, str]] = []
         backend_lines: list[str] = []
 
         def add_attempts(source: str, found: list[tuple[str, float]]) -> None:
@@ -462,6 +699,19 @@ class CardOCREngine:
                 "EasyOCR number binary",
                 self._easy_read(reader, number_binary, self.NUMBER_ALLOWLIST),
             )
+            if title_processed is not None and title_binary is not None:
+                title_attempts.extend(
+                    (text, score, "EasyOCR title enhanced")
+                    for text, score in self._easy_read(
+                        reader, title_processed, self.TITLE_ALLOWLIST
+                    )
+                )
+                title_attempts.extend(
+                    (text, score, "EasyOCR title binary")
+                    for text, score in self._easy_read(
+                        reader, title_binary, self.TITLE_ALLOWLIST
+                    )
+                )
             if enhanced:
                 add_attempts(
                     "EasyOCR set adaptive",
@@ -479,7 +729,7 @@ class CardOCREngine:
                         self.NUMBER_ALLOWLIST,
                     ),
                 )
-            backend_lines.append("Primary engine: EasyOCR (full, set, and number regions)")
+            backend_lines.append("Primary engine: EasyOCR (title, full, set, and number regions)")
         elif self._easy_error:
             backend_lines.append(f"EasyOCR unavailable: {self._easy_error}")
 
@@ -526,6 +776,7 @@ class CardOCREngine:
         parsed = self._parse_attempts(attempts)
 
         set_code, collector_number, printed_total, matched_text, matched_confidence = parsed
+        card_name, card_name_confidence = self._best_title_attempt(title_attempts)
         texts = [text for text, _score, _source in attempts if text]
         evidence = self._text_evidence(texts)
 
@@ -554,7 +805,8 @@ class CardOCREngine:
         raw_lines = [
             f"Capture quality: {capture_quality}%",
             f"Identifier evidence: {evidence}%",
-            "Recognition strategy: separate set-code and collector-number OCR, then catalog lookup",
+            f"Card alignment: {'perspective corrected' if perspective_corrected else 'fixed guide'}",
+            "Recognition strategy: title, set-code, and collector-number OCR, then catalog resolution",
             *backend_lines,
             "OCR attempts:",
         ]
@@ -562,10 +814,16 @@ class CardOCREngine:
             f"  {index + 1}: [{source}] {text or '<nothing>'} ({score:.0f}%)"
             for index, (text, score, source) in enumerate(attempts)
         )
-        if not attempts:
+        raw_lines.extend(
+            f"  {len(attempts) + index + 1}: [{source}] {text or '<nothing>'} ({score:.0f}%)"
+            for index, (text, score, source) in enumerate(title_attempts)
+        )
+        if not attempts and not title_attempts:
             raw_lines.append("  <nothing>")
 
         return OCRResult(
+            card_name=card_name,
+            card_name_confidence=card_name_confidence,
             set_code=set_code,
             collector_number=collector_number,
             printed_total=printed_total,

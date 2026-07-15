@@ -66,7 +66,8 @@ class ScannerTab(QWidget):
 
         note = QLabel(
             "Place the card inside the fixed guide, then click Capture & Read Card or press Space. "
-            "The app captures a short burst, keeps the sharpest still, reads the identifier, and checks the local catalog."
+            "The app captures a short burst, keeps the most readable still, reads the title and identifier, "
+            "and resolves the clues against the local catalog."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #888888;")
@@ -393,11 +394,6 @@ class ScannerTab(QWidget):
             Qt.TransformationMode.SmoothTransformation,
         )
 
-    @staticmethod
-    def _sharpness(frame) -> float:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
     def capture_card(self) -> None:
         if self.current_frame is None or self.camera is None or not self.camera.isOpened():
             return
@@ -414,7 +410,10 @@ class ScannerTab(QWidget):
             if ok:
                 candidates.append(self._rotate_frame(frame, orientation))
 
-        self.captured_frame = max(candidates, key=self._sharpness)
+        mode = str(self.settings.value("scanner/mode", "full"))
+        self.captured_frame = max(
+            candidates, key=lambda frame: self.ocr.capture_frame_score(frame, mode)
+        )
         candidates.clear()
         self.timer.stop()
         self._display_frame(self.captured_frame)
@@ -463,7 +462,7 @@ class ScannerTab(QWidget):
             if result.printed_total:
                 number += f"/{result.printed_total}"
             self.number_input.setText(number)
-        if result.card_name and result.confidence >= 60:
+        if result.card_name and result.card_name_confidence >= 30.0:
             self.card_name_input.setText(result.card_name)
 
         details = [
@@ -472,6 +471,10 @@ class ScannerTab(QWidget):
         ]
         if result.set_code:
             details.append(f"set: {result.set_code}")
+        if result.card_name:
+            details.append(
+                f"title: {result.card_name} ({result.card_name_confidence:.0f}%)"
+            )
         if result.collector_number:
             number = result.collector_number + (
                 f"/{result.printed_total}" if result.printed_total else ""
@@ -480,7 +483,12 @@ class ScannerTab(QWidget):
         self.ocr_status.setText(" • ".join(details))
 
         if result.set_code or result.collector_number:
-            self.find_matches(printed_total=result.printed_total)
+            self.find_matches(
+                printed_total=result.printed_total,
+                fuzzy_name_hint=(
+                    result.card_name if result.card_name_confidence >= 30.0 else ""
+                ),
+            )
 
         threshold = int(self.settings.value("scanner/confidence", 90))
         if result.confidence >= threshold and len(self.matches) == 1:
@@ -525,7 +533,11 @@ class ScannerTab(QWidget):
             "Live view ready. Position the next card and click Capture & Read Card or press Space."
         )
 
-    def find_matches(self, printed_total: int | None = None) -> None:
+    def find_matches(
+        self,
+        printed_total: int | None = None,
+        fuzzy_name_hint: str = "",
+    ) -> None:
         name = self.card_name_input.text().strip()
         set_query = self.set_input.text().strip()
         number_text = self.number_input.text().strip()
@@ -589,6 +601,47 @@ class ScannerTab(QWidget):
                 )
             used_relaxed_identifier_match = bool(self.matches)
 
+        used_title_resolution = False
+        title_hint = fuzzy_name_hint or name
+        if not self.matches and title_hint and set_query:
+            # A title such as SWPKE can still identify Slowpoke when SCR has
+            # one clearly superior catalog candidate. Do not require OCR to
+            # spell the title or collector fraction perfectly.
+            candidates = self.catalog.search_cards(
+                set_query=set_query,
+                limit=500,
+            )
+            candidates = self.ocr.rank_catalog_candidates(
+                candidates,
+                set_query,
+                name_hint=title_hint,
+                collector_hint=number,
+                printed_total=printed_total,
+            )
+            if self.ocr.decisive_catalog_match(
+                candidates, set_query, title_hint, collector_hint=number
+            ):
+                self.matches = candidates[:1]
+                card = self.matches[0]
+                self.card_name_input.setText(str(card.get("name", title_hint)))
+                self.set_input.setText(str(card.get("set_code", set_query)))
+                self.number_input.setText(str(card.get("number", number)))
+                self.ocr_status.setText(
+                    self.ocr_status.text()
+                    + f" | Catalog resolved {card.get('name', title_hint)} "
+                    + f"{card.get('set_code', set_query)} {card.get('number', number)}"
+                )
+                used_title_resolution = True
+            else:
+                # Keep a short, useful review list instead of displaying an
+                # entire set when the title evidence is not decisive.
+                self.matches = [
+                    card
+                    for card in candidates[:20]
+                    if self.ocr.name_similarity(title_hint, str(card.get("name", "")))
+                    >= 0.35
+                ]
+
         if self.matches and len(self.matches) == 1 and number and not set_query:
             best_code = str(self.matches[0].get("set_code", ""))
             if best_code:
@@ -598,7 +651,7 @@ class ScannerTab(QWidget):
                     self.ocr_status.text()
                     + f" | Catalog identified set {best_code}"
                 )
-        elif used_relaxed_identifier_match and set_query:
+        elif used_relaxed_identifier_match and set_query and not used_title_resolution:
             best_code = str(self.matches[0].get("set_code", ""))
             best_score = self.ocr.set_code_similarity(set_query, best_code)
             second_score = (
