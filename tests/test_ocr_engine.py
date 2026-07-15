@@ -43,6 +43,14 @@ class CardOCREngineTests(unittest.TestCase):
         self.assertEqual("67", collector)
         self.assertEqual(86, total)
 
+    def test_rejects_implausible_tiny_printed_total(self) -> None:
+        _code, collector, total, _text, _confidence = self.engine._parse_attempts(
+            [("7/1", 0.0, "Tesseract number enhanced")]
+        )
+
+        self.assertEqual("", collector)
+        self.assertIsNone(total)
+
     def test_extracts_set_code_before_english_language_marker(self) -> None:
         code, _collector, _total, _text, _confidence = self.engine._parse_attempts(
             [("BLK en", 80.0, "set region")]
@@ -347,6 +355,12 @@ class CardOCREngineTests(unittest.TestCase):
 
     def test_title_region_avoids_right_side_hp_area(self) -> None:
         self.assertEqual((70, 25, 800, 203), self.engine._title_region_bounds(1000, 1400))
+
+    def test_regulation_region_excludes_left_border_noise(self) -> None:
+        self.assertEqual(
+            (30, 5, 180, 90),
+            self.engine._regulation_region_bounds(1000, 100),
+        )
 
     def test_failed_easyocr_variant_does_not_abort_other_attempts(self) -> None:
         class BrokenReader:

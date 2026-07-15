@@ -216,12 +216,21 @@ class CardOCREngine:
         )
 
     @staticmethod
-    def _regulation_region(identifier: Any) -> Any:
+    def _regulation_region_bounds(
+        width: int, height: int
+    ) -> tuple[int, int, int, int]:
+        return (
+            int(width * 0.03),
+            int(height * 0.05),
+            max(1, int(width * 0.18)),
+            max(1, int(height * 0.90)),
+        )
+
+    @classmethod
+    def _regulation_region(cls, identifier: Any) -> Any:
         height, width = identifier.shape[:2]
-        return identifier[
-            int(height * 0.05) : int(height * 0.90),
-            int(width * 0.02) : int(width * 0.18),
-        ].copy()
+        left, top, right, bottom = cls._regulation_region_bounds(width, height)
+        return identifier[top:bottom, left:right].copy()
 
     @staticmethod
     def _prepare(image: Any, scale: float, threshold: bool = False) -> Any:
@@ -415,7 +424,7 @@ class CardOCREngine:
             return "", None
         collector_value = int(digits[:3])
         total_value = int(digits[-3:])
-        if 0 <= collector_value <= 999 and 1 <= total_value <= 999:
+        if 0 <= collector_value <= 999 and 5 <= total_value <= 999:
             return str(collector_value), total_value
         return "", None
 
@@ -469,7 +478,7 @@ class CardOCREngine:
                 if len(total_text) == 4:
                     total_text = total_text[:3]
                 total_value = int(total_text)
-                if 0 <= collector_value <= 999 and 1 <= total_value <= 999:
+                if 0 <= collector_value <= 999 and 5 <= total_value <= 999:
                     collector = str(collector_value)
                     total = total_value
             if not collector:
