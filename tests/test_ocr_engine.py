@@ -43,6 +43,34 @@ class CardOCREngineTests(unittest.TestCase):
         self.assertEqual("67", collector)
         self.assertEqual(86, total)
 
+    def test_extracts_set_code_before_english_language_marker(self) -> None:
+        code, _collector, _total, _text, _confidence = self.engine._parse_attempts(
+            [("BLK en", 80.0, "set region")]
+        )
+
+        self.assertEqual("BLK", code)
+
+    def test_posted_live_attempts_recover_blk_and_dense_number(self) -> None:
+        attempts = [
+            ("LDD", 13.0, "EasyOCR full strip"),
+            ("BLKII067/1085", 3.0, "EasyOCR full strip"),
+            ("BLKC", 43.0, "EasyOCR set binary"),
+            ("1067/10885", 38.0, "EasyOCR number binary"),
+            ("GAK", 0.0, "Tesseract set enhanced"),
+            ("0677066", 0.0, "Tesseract number enhanced"),
+            ("067066", 0.0, "Tesseract number binary"),
+        ]
+
+        code, collector, total, matched_text, confidence = (
+            self.engine._parse_attempts(attempts)
+        )
+
+        self.assertEqual("BLK", code)
+        self.assertEqual("67", collector)
+        self.assertEqual(66, total)
+        self.assertEqual("0677066", matched_text)
+        self.assertEqual(0.0, confidence)
+
     def test_garbage_text_does_not_report_full_identifier_evidence(self) -> None:
         texts = ["H", "11B05015", "1", "G86"]
 

@@ -255,6 +255,37 @@ class CardOCREngine:
         normalized = normalized.replace("S", "5").replace("B", "8")
         return normalized
 
+    @classmethod
+    def _extract_set_code(cls, text: str, source: str) -> str:
+        normalized = cls._normalize(text)
+        exact = cls.SET_CODE.search(normalized)
+        if exact:
+            return exact.group(1)
+
+        # Targeted set OCR often joins the language marker or a neighboring
+        # glyph to the code: BLK en -> BLKEN, or BLK plus a symbol -> BLKC.
+        if "set" in source.casefold():
+            letters = re.sub(r"[^A-Z]", "", normalized)
+            if len(letters) >= 3:
+                return letters[:3]
+        return ""
+
+    @classmethod
+    def _extract_dense_fraction(
+        cls, text: str, source: str
+    ) -> tuple[str, int | None]:
+        """Recover a 3+3 fraction when OCR loses the printed slash."""
+        if "number" not in source.casefold():
+            return "", None
+        digits = re.sub(r"\D", "", cls._numeric_normalize(text))
+        if len(digits) not in {6, 7}:
+            return "", None
+        collector_value = int(digits[:3])
+        total_value = int(digits[-3:])
+        if 0 <= collector_value <= 999 and 1 <= total_value <= 999:
+            return str(collector_value), total_value
+        return "", None
+
     def _parse_attempts(
         self, attempts: list[tuple[str, float, str]]
     ) -> tuple[str, str, int | None, str, float]:
@@ -266,12 +297,11 @@ class CardOCREngine:
         best_text = ""
         best_confidence = 0.0
 
-        for text, confidence, _source in attempts:
+        for text, confidence, source in attempts:
             normalized = self._normalize(text)
             numeric = self._numeric_normalize(text)
-            code_match = self.SET_CODE.search(normalized)
             fraction_match = self.COLLECTOR_FRACTION.search(numeric)
-            code = code_match.group(1) if code_match else ""
+            code = self._extract_set_code(text, source)
             collector = ""
             total: int | None = None
             if fraction_match:
@@ -285,6 +315,8 @@ class CardOCREngine:
                 if 0 <= collector_value <= 999 and 1 <= total_value <= 999:
                     collector = str(collector_value)
                     total = total_value
+            if not collector:
+                collector, total = self._extract_dense_fraction(text, source)
 
             if code and confidence >= 5.0 and confidence > best_code_confidence:
                 best_code = code

@@ -561,6 +561,16 @@ class ScannerTab(QWidget):
             self.matches = self.ocr.rank_catalog_candidates(
                 self.matches, set_query
             )
+            if (
+                self.matches
+                and self.ocr.set_code_similarity(
+                    set_query, str(self.matches[0].get("set_code", ""))
+                )
+                < 0.60
+            ):
+                # The collector total was probably the noisy field. Do not let
+                # unrelated exact-total matches prevent the number-only retry.
+                self.matches = []
             used_relaxed_identifier_match = bool(self.matches)
 
         if not self.matches and number:
