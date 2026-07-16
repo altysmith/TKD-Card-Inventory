@@ -12,11 +12,19 @@ if "cv2" not in sys.modules:
     sys.modules["cv2"] = types.ModuleType("cv2")
 
 from src.ocr_engine import CardOCREngine
+from src.card_matcher import CardMatcher
+
+
+class EmptyCatalog:
+    @staticmethod
+    def search_cards(**_kwargs):
+        return []
 
 
 class CardOCREngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = CardOCREngine()
+        self.matcher = CardMatcher(EmptyCatalog())
 
     def test_combines_separate_blk_and_collector_fraction_attempts(self) -> None:
         attempts = [
@@ -119,7 +127,7 @@ class CardOCREngineTests(unittest.TestCase):
             {"name": "Other", "set_name": "Other", "set_code": "G1"},
         ]
 
-        ranked = self.engine.rank_catalog_candidates(cards, "BLN")
+        ranked = self.matcher.rank_catalog_candidates(cards, "BLN")
 
         self.assertEqual("BLK", ranked[0]["set_code"])
 
@@ -151,13 +159,13 @@ class CardOCREngineTests(unittest.TestCase):
             },
         ]
 
-        ranked = self.engine.rank_catalog_candidates(
+        ranked = self.matcher.rank_catalog_candidates(
             cards, "SCR", name_hint="SWPKE"
         )
 
         self.assertEqual("Slowpoke", ranked[0]["name"])
         self.assertTrue(
-            self.engine.decisive_title_match(ranked, "SCR", "SWPKE")
+            self.matcher.decisive_title_match(ranked, "SCR", "SWPKE")
         )
 
     def test_ambiguous_title_is_not_declared_decisive(self) -> None:
@@ -165,11 +173,11 @@ class CardOCREngineTests(unittest.TestCase):
             {"name": "Mew ex", "set_code": "MEW", "number": "151/165"},
             {"name": "Mew ex", "set_code": "MEW", "number": "193/165"},
         ]
-        ranked = self.engine.rank_catalog_candidates(
+        ranked = self.matcher.rank_catalog_candidates(
             cards, "MEW", name_hint="MEWEX"
         )
 
-        self.assertFalse(self.engine.decisive_title_match(ranked, "MEW", "MEWEX"))
+        self.assertFalse(self.matcher.decisive_title_match(ranked, "MEW", "MEWEX"))
 
     def test_collector_number_breaks_a_duplicate_title_tie(self) -> None:
         cards = [
@@ -186,13 +194,13 @@ class CardOCREngineTests(unittest.TestCase):
                 "number": "193/165",
             },
         ]
-        ranked = self.engine.rank_catalog_candidates(
+        ranked = self.matcher.rank_catalog_candidates(
             cards, "MEW", name_hint="MEWEX", collector_hint="193"
         )
 
         self.assertEqual("193", ranked[0]["raw_number"])
         self.assertTrue(
-            self.engine.decisive_catalog_match(
+            self.matcher.decisive_catalog_match(
                 ranked, "MEW", "MEWEX", collector_hint="193"
             )
         )
@@ -222,7 +230,7 @@ class CardOCREngineTests(unittest.TestCase):
             },
         ]
 
-        narrowed, used_set, used_identifier = self.engine.narrow_exact_name_candidates(
+        narrowed, used_set, used_identifier = self.matcher.narrow_exact_name_candidates(
             cards,
             "Slowpoke",
             set_hint="FCO",
@@ -252,7 +260,7 @@ class CardOCREngineTests(unittest.TestCase):
             },
         ]
 
-        narrowed, used_set, used_identifier = self.engine.narrow_exact_name_candidates(
+        narrowed, used_set, used_identifier = self.matcher.narrow_exact_name_candidates(
             cards,
             "Slowpoke",
             set_hint="SCR",
@@ -292,7 +300,7 @@ class CardOCREngineTests(unittest.TestCase):
             },
         ]
 
-        narrowed, _used_set, _used_identifier = self.engine.narrow_exact_name_candidates(
+        narrowed, _used_set, _used_identifier = self.matcher.narrow_exact_name_candidates(
             cards,
             "Slowpoke",
             regulation_mark="H",
@@ -306,7 +314,7 @@ class CardOCREngineTests(unittest.TestCase):
             {"name": "Slowpoke", "set_code": "SCR", "raw_number": "57", "printed_total": 142},
             {"name": "Slowpoke", "set_code": "BKP", "raw_number": "57", "printed_total": 122},
         ]
-        narrowed, _used_set, used_identifier = self.engine.narrow_exact_name_candidates(
+        narrowed, _used_set, used_identifier = self.matcher.narrow_exact_name_candidates(
             cards, "Slowpoke", collector_hint="57", trust_set_hint=False
         )
         self.assertFalse(used_identifier)
@@ -317,7 +325,7 @@ class CardOCREngineTests(unittest.TestCase):
             {"name": "Slowpoke", "set_code": "SCR", "raw_number": "57", "printed_total": 142},
             {"name": "Slowpoke", "set_code": "BKP", "raw_number": "57", "printed_total": 122},
         ]
-        narrowed, _used_set, used_identifier = self.engine.narrow_exact_name_candidates(
+        narrowed, _used_set, used_identifier = self.matcher.narrow_exact_name_candidates(
             cards,
             "Slowpoke",
             collector_hint="57",
@@ -332,7 +340,7 @@ class CardOCREngineTests(unittest.TestCase):
             {"name": "Slowpoke", "set_code": "SCR", "raw_number": "57", "printed_total": 142},
             {"name": "Slowpoke", "set_code": "BKP", "raw_number": "57", "printed_total": 122},
         ]
-        narrowed, used_set, used_identifier = self.engine.narrow_exact_name_candidates(
+        narrowed, used_set, used_identifier = self.matcher.narrow_exact_name_candidates(
             cards,
             "Slowpoke",
             set_hint="BKP",
@@ -344,10 +352,10 @@ class CardOCREngineTests(unittest.TestCase):
         self.assertEqual("SCR", narrowed[0]["set_code"])
 
     def test_leading_noise_suffix_is_only_a_catalog_hypothesis(self) -> None:
-        self.assertEqual("67", self.engine.collector_leading_noise_suffix("267", 86))
-        self.assertEqual("67", self.engine.collector_leading_noise_suffix("967", 86))
-        self.assertEqual("", self.engine.collector_leading_noise_suffix("67", 86))
-        self.assertEqual("", self.engine.collector_leading_noise_suffix("267", None))
+        self.assertEqual("67", self.matcher.collector_leading_noise_suffix("267", 86))
+        self.assertEqual("67", self.matcher.collector_leading_noise_suffix("967", 86))
+        self.assertEqual("", self.matcher.collector_leading_noise_suffix("67", 86))
+        self.assertEqual("", self.matcher.collector_leading_noise_suffix("267", None))
 
     def test_corrected_fraction_requires_title_separation(self) -> None:
         cards = [
@@ -356,12 +364,12 @@ class CardOCREngineTests(unittest.TestCase):
             {"name": "Sliggoo", "set_code": "CRI"},
         ]
         self.assertTrue(
-            self.engine.decisive_fraction_title_match(
+            self.matcher.decisive_fraction_title_match(
                 cards, "BUK", "Genesectex"
             )
         )
         self.assertFalse(
-            self.engine.decisive_fraction_title_match(cards, "BLK", "DASG")
+            self.matcher.decisive_fraction_title_match(cards, "BLK", "DASG")
         )
 
     def test_number_reader_adds_left_to_right_combined_attempt(self) -> None:
@@ -401,11 +409,11 @@ class CardOCREngineTests(unittest.TestCase):
         ]
         number_hints = (("0372", 36.0), ("664", 16.0))
 
-        ranked = self.engine.rank_number_fragment_candidates(cards, number_hints)
+        ranked = self.matcher.rank_number_fragment_candidates(cards, number_hints)
 
         self.assertEqual("SCR", ranked[0]["set_code"])
         self.assertTrue(
-            self.engine.decisive_number_fragment_match(ranked, number_hints)
+            self.matcher.decisive_number_fragment_match(ranked, number_hints)
         )
 
     def test_regulation_picker_uses_strongest_single_letter(self) -> None:

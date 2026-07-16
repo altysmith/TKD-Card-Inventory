@@ -58,5 +58,9 @@ card only when multiple compatible clues make it decisive. Partial collector
 numbers and printed totals never force automatic selection on their own;
 ambiguous prints remain available for manual review.
 
+Catalog resolution is implemented in a standalone, non-Qt `CardMatcher` so
+matching strategies and confidence thresholds can be tested independently of
+the camera and desktop interface.
+
 Foil glare can still obscure printed details. A fixed camera position with
 soft, diffuse lighting gives the most repeatable results.

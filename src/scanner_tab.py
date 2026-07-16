@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from .catalog import PokemonCatalog
+from .card_matcher import CardMatcher
 from .database import InventoryDatabase
 from .ocr_engine import CardOCREngine, OCRResult
 from .scan_logger import ScanLogger
@@ -41,6 +42,9 @@ class ScannerTab(QWidget):
     BURST_FRAME_COUNT = 6
     UNSTABLE_EXTRA_FRAMES = 4
     STABILITY_THRESHOLD = 65
+    TITLE_CONFIDENCE_MIN = 30.0
+    SET_CONFIDENCE_MIN = 70.0
+    REGULATION_CONFIDENCE_MIN = 90.0
 
     def __init__(
         self,
@@ -55,6 +59,7 @@ class ScannerTab(QWidget):
         self.inventory_changed = inventory_changed
         self.settings = settings
         self.ocr = CardOCREngine()
+        self.matcher = CardMatcher(catalog)
         self.scan_logger = ScanLogger(database.path.parent / "scan_history.csv")
 
         self.camera: cv2.VideoCapture | None = None
@@ -499,7 +504,7 @@ class ScannerTab(QWidget):
             if result.printed_total:
                 number += f"/{result.printed_total}"
             self.number_input.setText(number)
-        if result.card_name and result.card_name_confidence >= 30.0:
+        if result.card_name and result.card_name_confidence >= self.TITLE_CONFIDENCE_MIN:
             self.card_name_input.setText(result.card_name)
 
         details = [
@@ -530,13 +535,16 @@ class ScannerTab(QWidget):
             self.find_matches(
                 printed_total=result.printed_total,
                 fuzzy_name_hint=(
-                    result.card_name if result.card_name_confidence >= 30.0 else ""
+                    result.card_name
+                    if result.card_name_confidence >= self.TITLE_CONFIDENCE_MIN
+                    else ""
                 ),
-                prefer_name=result.card_name_confidence >= 30.0,
-                trust_set_hint=result.set_code_confidence >= 70.0,
+                prefer_name=result.card_name_confidence >= self.TITLE_CONFIDENCE_MIN,
+                trust_set_hint=result.set_code_confidence >= self.SET_CONFIDENCE_MIN,
                 regulation_mark=(
                     result.regulation_mark
-                    if result.regulation_mark_confidence >= 90.0
+                    if result.regulation_mark_confidence
+                    >= self.REGULATION_CONFIDENCE_MIN
                     else ""
                 ),
                 number_hints=result.number_hints,
@@ -639,279 +647,40 @@ class ScannerTab(QWidget):
         regulation_mark: str = "",
         number_hints: tuple[tuple[str, float], ...] = (),
     ) -> None:
-        self._catalog_match_decisive = False
         name = self.card_name_input.text().strip()
         set_query = self.set_input.text().strip()
         number_text = self.number_input.text().strip()
-        number = number_text.split("/")[0] if number_text else ""
-        if printed_total is None and "/" in number_text:
-            total_text = number_text.split("/", 1)[1].strip()
-            if total_text.isdigit():
-                printed_total = int(total_text)
-        if not name and not set_query and not number:
+        if not name and not set_query and not number_text:
             QMessageBox.information(
                 self, "Identify card", "Enter a set acronym, number, or card name."
             )
             return
 
-        title_hint = fuzzy_name_hint or name
-        if prefer_name and title_hint and number and printed_total is not None:
-            fraction_candidates = self.catalog.search_cards(
-                number=number,
-                printed_total=printed_total,
-                limit=100,
-            )
-            fraction_candidates = self.ocr.rank_catalog_candidates(
-                fraction_candidates,
-                set_query,
-                name_hint=title_hint,
-                collector_hint=number,
-                printed_total=printed_total,
-            )
-            if self.ocr.decisive_fraction_title_match(
-                fraction_candidates, set_query, title_hint
-            ):
-                self.matches = fraction_candidates[:1]
-                card = self.matches[0]
-                self.card_name_input.setText(str(card.get("name", title_hint)))
-                self.set_input.setText(str(card.get("set_code", set_query)))
-                self.number_input.setText(str(card.get("number", number)))
-                self._catalog_match_decisive = True
-                self.ocr_status.setText(
-                    self.ocr_status.text()
-                    + f" | Catalog resolved {card.get('name', title_hint)} "
-                    + f"{card.get('set_code', set_query)} {card.get('number', number)}"
-                )
-                self._populate_matches_table(select_first=True)
-                return
-        if prefer_name and title_hint:
-            title_candidates = self.catalog.search_cards(
-                name=title_hint,
-                limit=500,
-            )
-            exact_title_count = sum(
-                self.ocr.name_similarity(
-                    title_hint, str(card.get("name", ""))
-                )
-                == 1.0
-                for card in title_candidates
-            )
-            (
-                title_candidates,
-                used_set_hint,
-                used_exact_identifier,
-            ) = self.ocr.narrow_exact_name_candidates(
-                title_candidates,
-                title_hint,
-                set_hint=set_query,
-                collector_hint=number,
-                printed_total=printed_total,
-                trust_set_hint=trust_set_hint,
-                regulation_mark=regulation_mark,
-            )
-            if title_candidates:
-                self.matches = self.ocr.rank_number_fragment_candidates(
-                    title_candidates, number_hints
-                )
-                fragments_are_decisive = self.ocr.decisive_number_fragment_match(
-                    self.matches, number_hints
-                )
-                if fragments_are_decisive:
-                    self.matches = self.matches[:1]
-                single_is_decisive = len(self.matches) == 1 and (
-                    exact_title_count == 1
-                    or used_set_hint
-                    or used_exact_identifier
-                    or fragments_are_decisive
-                )
-                ignored_set_hint = bool(set_query and not used_set_hint)
-                if ignored_set_hint:
-                    ignored_code = set_query
-                    self.set_input.clear()
-                    self.ocr_status.setText(
-                        self.ocr_status.text()
-                        + f" | Ignored conflicting set guess {ignored_code}"
-                    )
-                if single_is_decisive:
-                    self._catalog_match_decisive = True
-                    card = self.matches[0]
-                    self.card_name_input.setText(str(card.get("name", title_hint)))
-                    self.set_input.setText(str(card.get("set_code", "")))
-                    self.number_input.setText(str(card.get("number", "")))
-                    self.ocr_status.setText(
-                        self.ocr_status.text()
-                        + f" | Catalog resolved {card.get('name', title_hint)} "
-                        + f"{card.get('set_code', '')} {card.get('number', '')}"
-                    )
-                elif len(self.matches) == 1:
-                    self.ocr_status.setText(
-                        self.ocr_status.text()
-                        + " | One print suggested by supporting evidence; confirmation required"
-                    )
-                else:
-                    self.ocr_status.setText(
-                        self.ocr_status.text()
-                        + f" | Exact title found; {len(self.matches)} prints need set or number confirmation"
-                    )
-                self._populate_matches_table(select_first=single_is_decisive)
-                return
-
-        self.matches = self.catalog.search_cards(
+        resolution = self.matcher.resolve(
             name=name,
             set_query=set_query,
-            number=number,
+            number_text=number_text,
             printed_total=printed_total,
-            limit=100,
+            fuzzy_name_hint=fuzzy_name_hint,
+            prefer_name=prefer_name,
+            trust_set_hint=trust_set_hint,
+            regulation_mark=regulation_mark,
+            number_hints=number_hints,
         )
-        used_relaxed_identifier_match = False
-        if not self.matches and set_query and number:
-            # Keep the reliable collector fraction exact while relaxing only
-            # the noisy set badge. For 67/86 this narrows the catalog to three
-            # candidates before BLN is compared with the real BLK code.
-            self.matches = self.catalog.search_cards(
-                name=name,
-                number=number,
-                printed_total=printed_total,
-                limit=100,
-            )
-            self.matches = self.ocr.rank_catalog_candidates(
-                self.matches, set_query
-            )
-            if (
-                self.matches
-                and self.ocr.set_code_similarity(
-                    set_query, str(self.matches[0].get("set_code", ""))
-                )
-                < 0.60
-            ):
-                # The collector total was probably the noisy field. Do not let
-                # unrelated exact-total matches prevent the number-only retry.
-                self.matches = []
-            used_relaxed_identifier_match = bool(self.matches)
+        self.matches = resolution.matches
+        self._catalog_match_decisive = resolution.decisive
 
-        if not self.matches and number:
-            # OCR commonly gets one character of a small set badge or printed
-            # total wrong (for example BLK -> BLN or 086 -> 066). The collector
-            # number is usually more reliable, so retrieve its candidates and
-            # let the catalog rank/correct the noisy fields.
-            self.matches = self.catalog.search_cards(
-                name=name,
-                number=number,
-                limit=100,
+        if resolution.name_value is not None:
+            self.card_name_input.setText(resolution.name_value)
+        if resolution.set_value is not None:
+            self.set_input.setText(resolution.set_value)
+        if resolution.number_value is not None:
+            self.number_input.setText(resolution.number_value)
+        if resolution.message:
+            self.ocr_status.setText(
+                self.ocr_status.text() + f" | {resolution.message}"
             )
-            if set_query:
-                self.matches = self.ocr.rank_catalog_candidates(
-                    self.matches, set_query
-                )
-            used_relaxed_identifier_match = bool(self.matches)
-
-        corrected_number = self.ocr.collector_leading_noise_suffix(
-            number, printed_total
-        )
-        if not self.matches and corrected_number and title_hint:
-            candidates = self.catalog.search_cards(
-                number=corrected_number,
-                printed_total=printed_total,
-                limit=100,
-            )
-            candidates = self.ocr.rank_catalog_candidates(
-                candidates,
-                set_query,
-                name_hint=title_hint,
-                collector_hint=corrected_number,
-                printed_total=printed_total,
-            )
-            if self.ocr.decisive_fraction_title_match(
-                candidates, set_query, title_hint
-            ):
-                self.matches = candidates[:1]
-                card = self.matches[0]
-                self.card_name_input.setText(str(card.get("name", title_hint)))
-                self.set_input.setText(str(card.get("set_code", set_query)))
-                self.number_input.setText(str(card.get("number", corrected_number)))
-                self.ocr_status.setText(
-                    self.ocr_status.text()
-                    + f" | Catalog corrected leading number noise to "
-                    + f"{card.get('number', corrected_number)}"
-                )
-                self._catalog_match_decisive = True
-            elif candidates:
-                self.matches = candidates[:20]
-
-        used_title_resolution = False
-        if not self.matches and title_hint and set_query:
-            # A title such as SWPKE can still identify Slowpoke when SCR has
-            # one clearly superior catalog candidate. Do not require OCR to
-            # spell the title or collector fraction perfectly.
-            candidates = self.catalog.search_cards(
-                set_query=set_query,
-                limit=500,
-            )
-            candidates = self.ocr.rank_catalog_candidates(
-                candidates,
-                set_query,
-                name_hint=title_hint,
-                collector_hint=number,
-                printed_total=printed_total,
-            )
-            if self.ocr.decisive_catalog_match(
-                candidates, set_query, title_hint, collector_hint=number
-            ):
-                self.matches = candidates[:1]
-                card = self.matches[0]
-                self.card_name_input.setText(str(card.get("name", title_hint)))
-                self.set_input.setText(str(card.get("set_code", set_query)))
-                self.number_input.setText(str(card.get("number", number)))
-                self.ocr_status.setText(
-                    self.ocr_status.text()
-                    + f" | Catalog resolved {card.get('name', title_hint)} "
-                    + f"{card.get('set_code', set_query)} {card.get('number', number)}"
-                )
-                used_title_resolution = True
-                self._catalog_match_decisive = True
-            else:
-                # Keep a short, useful review list instead of displaying an
-                # entire set when the title evidence is not decisive.
-                self.matches = [
-                    card
-                    for card in candidates[:20]
-                    if self.ocr.name_similarity(title_hint, str(card.get("name", "")))
-                    >= 0.35
-                ]
-
-        if self.matches and len(self.matches) == 1 and number and not set_query:
-            best_code = str(self.matches[0].get("set_code", ""))
-            if best_code:
-                self.set_input.setText(best_code)
-                self.number_input.setText(str(self.matches[0].get("number", number)))
-                self.ocr_status.setText(
-                    self.ocr_status.text()
-                    + f" | Catalog identified set {best_code}"
-                )
-        elif used_relaxed_identifier_match and set_query and not used_title_resolution:
-            best_code = str(self.matches[0].get("set_code", ""))
-            best_score = self.ocr.set_code_similarity(set_query, best_code)
-            second_score = (
-                self.ocr.set_code_similarity(
-                    set_query, str(self.matches[1].get("set_code", ""))
-                )
-                if len(self.matches) > 1
-                else 0.0
-            )
-            if best_code and best_score >= 0.60 and best_score - second_score >= 0.15:
-                self.matches = [
-                    card
-                    for card in self.matches
-                    if str(card.get("set_code", "")).casefold()
-                    == best_code.casefold()
-                ]
-                self.set_input.setText(best_code)
-                self.number_input.setText(str(self.matches[0].get("number", number)))
-                self.ocr_status.setText(
-                    self.ocr_status.text()
-                    + f" | Catalog resolved {best_code} {self.matches[0].get('number', number)}"
-                )
-        self._populate_matches_table(select_first=self._catalog_match_decisive)
+        self._populate_matches_table(select_first=resolution.decisive)
 
     def _populate_matches_table(self, select_first: bool = True) -> None:
         self.matches_table.setRowCount(len(self.matches))
