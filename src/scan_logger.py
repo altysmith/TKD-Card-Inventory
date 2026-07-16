@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,3 +34,23 @@ class ScanLogger:
             if is_new:
                 writer.writeheader()
             writer.writerow(row)
+
+    def visible_path(self) -> Path:
+        """Return the Explorer-visible path when Windows Store Python redirects writes."""
+        local_text = os.environ.get("LOCALAPPDATA", "")
+        if not local_text:
+            return self.path
+        local = Path(local_text)
+        try:
+            relative = self.path.relative_to(local)
+        except ValueError:
+            return self.path
+        package_root = local / "Packages"
+        candidates = [
+            root / "LocalCache" / "Local" / relative
+            for root in package_root.glob("PythonSoftwareFoundation.Python.*")
+        ]
+        existing = [candidate for candidate in candidates if candidate.exists()]
+        if existing:
+            return max(existing, key=lambda candidate: candidate.stat().st_mtime)
+        return self.path

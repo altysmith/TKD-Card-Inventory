@@ -343,6 +343,41 @@ class CardOCREngineTests(unittest.TestCase):
         self.assertFalse(used_set)
         self.assertEqual("SCR", narrowed[0]["set_code"])
 
+    def test_leading_noise_suffix_is_only_a_catalog_hypothesis(self) -> None:
+        self.assertEqual("67", self.engine.collector_leading_noise_suffix("267", 86))
+        self.assertEqual("67", self.engine.collector_leading_noise_suffix("967", 86))
+        self.assertEqual("", self.engine.collector_leading_noise_suffix("67", 86))
+        self.assertEqual("", self.engine.collector_leading_noise_suffix("267", None))
+
+    def test_corrected_fraction_requires_title_separation(self) -> None:
+        cards = [
+            {"name": "Genesect ex", "set_code": "BLK"},
+            {"name": "Hydreigon ex", "set_code": "WHT"},
+            {"name": "Sliggoo", "set_code": "CRI"},
+        ]
+        self.assertTrue(
+            self.engine.decisive_fraction_title_match(
+                cards, "BUK", "Genesectex"
+            )
+        )
+        self.assertFalse(
+            self.engine.decisive_fraction_title_match(cards, "BLK", "DASG")
+        )
+
+    def test_number_reader_adds_left_to_right_combined_attempt(self) -> None:
+        class Reader:
+            @staticmethod
+            def readtext(*_args, **_kwargs):
+                return [
+                    ([[30, 0], [40, 0], [40, 10], [30, 10]], "/142", 0.8),
+                    ([[0, 0], [20, 0], [20, 10], [0, 10]], "057", 0.9),
+                ]
+
+        attempts = self.engine._easy_read(
+            Reader(), object(), self.engine.NUMBER_ALLOWLIST, join_line=True
+        )
+        self.assertIn(("057/142", 85.0), attempts)
+
     def test_posted_number_fragments_resolve_scr_after_regulation_filter(self) -> None:
         cards = [
             {

@@ -3,8 +3,16 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import cv2
-from PySide6.QtCore import QSettings, QTimer, Qt
-from PySide6.QtGui import QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QSettings, QTimer, Qt, QUrl
+from PySide6.QtGui import (
+    QDesktopServices,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
@@ -191,7 +199,17 @@ class ScannerTab(QWidget):
         self.enhanced_button = QPushButton("Retry Enhanced OCR on This Capture")
         self.enhanced_button.clicked.connect(self.retry_enhanced_ocr)
         self.enhanced_button.setEnabled(False)
-        debug_layout.addWidget(self.enhanced_button, alignment=Qt.AlignmentFlag.AlignRight)
+        debug_buttons = QHBoxLayout()
+        self.log_folder_button = QPushButton("Open Scan Log Folder")
+        self.log_folder_button.clicked.connect(self.open_scan_log_folder)
+        debug_buttons.addWidget(self.log_folder_button)
+        debug_buttons.addStretch()
+        debug_buttons.addWidget(self.enhanced_button)
+        debug_layout.addLayout(debug_buttons)
+        self.log_path_label = QLabel(f"Automatic scan log: {self.scan_logger.visible_path()}")
+        self.log_path_label.setWordWrap(True)
+        self.log_path_label.setStyleSheet("color: #888888;")
+        debug_layout.addWidget(self.log_path_label)
         root.addWidget(self.debug_group)
 
         queue_heading = QLabel("Scan queue")
@@ -518,7 +536,7 @@ class ScannerTab(QWidget):
                 trust_set_hint=result.set_code_confidence >= 70.0,
                 regulation_mark=(
                     result.regulation_mark
-                    if result.regulation_mark_confidence >= 60.0
+                    if result.regulation_mark_confidence >= 90.0
                     else ""
                 ),
                 number_hints=result.number_hints,
@@ -588,8 +606,16 @@ class ScannerTab(QWidget):
                     "raw_ocr": result.raw_text,
                 }
             )
+            self.log_path_label.setText(
+                f"Automatic scan log: {self.scan_logger.visible_path()}"
+            )
         except OSError:
             pass
+
+    def open_scan_log_folder(self) -> None:
+        path = self.scan_logger.visible_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
 
     def resume_live_view(self) -> None:
         if self.camera is None or not self.camera.isOpened():
@@ -629,6 +655,35 @@ class ScannerTab(QWidget):
             return
 
         title_hint = fuzzy_name_hint or name
+        if prefer_name and title_hint and number and printed_total is not None:
+            fraction_candidates = self.catalog.search_cards(
+                number=number,
+                printed_total=printed_total,
+                limit=100,
+            )
+            fraction_candidates = self.ocr.rank_catalog_candidates(
+                fraction_candidates,
+                set_query,
+                name_hint=title_hint,
+                collector_hint=number,
+                printed_total=printed_total,
+            )
+            if self.ocr.decisive_fraction_title_match(
+                fraction_candidates, set_query, title_hint
+            ):
+                self.matches = fraction_candidates[:1]
+                card = self.matches[0]
+                self.card_name_input.setText(str(card.get("name", title_hint)))
+                self.set_input.setText(str(card.get("set_code", set_query)))
+                self.number_input.setText(str(card.get("number", number)))
+                self._catalog_match_decisive = True
+                self.ocr_status.setText(
+                    self.ocr_status.text()
+                    + f" | Catalog resolved {card.get('name', title_hint)} "
+                    + f"{card.get('set_code', set_query)} {card.get('number', number)}"
+                )
+                self._populate_matches_table(select_first=True)
+                return
         if prefer_name and title_hint:
             title_candidates = self.catalog.search_cards(
                 name=title_hint,
@@ -749,6 +804,39 @@ class ScannerTab(QWidget):
                     self.matches, set_query
                 )
             used_relaxed_identifier_match = bool(self.matches)
+
+        corrected_number = self.ocr.collector_leading_noise_suffix(
+            number, printed_total
+        )
+        if not self.matches and corrected_number and title_hint:
+            candidates = self.catalog.search_cards(
+                number=corrected_number,
+                printed_total=printed_total,
+                limit=100,
+            )
+            candidates = self.ocr.rank_catalog_candidates(
+                candidates,
+                set_query,
+                name_hint=title_hint,
+                collector_hint=corrected_number,
+                printed_total=printed_total,
+            )
+            if self.ocr.decisive_fraction_title_match(
+                candidates, set_query, title_hint
+            ):
+                self.matches = candidates[:1]
+                card = self.matches[0]
+                self.card_name_input.setText(str(card.get("name", title_hint)))
+                self.set_input.setText(str(card.get("set_code", set_query)))
+                self.number_input.setText(str(card.get("number", corrected_number)))
+                self.ocr_status.setText(
+                    self.ocr_status.text()
+                    + f" | Catalog corrected leading number noise to "
+                    + f"{card.get('number', corrected_number)}"
+                )
+                self._catalog_match_decisive = True
+            elif candidates:
+                self.matches = candidates[:20]
 
         used_title_resolution = False
         if not self.matches and title_hint and set_query:

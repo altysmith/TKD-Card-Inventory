@@ -276,7 +276,7 @@ class CardOCREngine:
 
     @staticmethod
     def _easy_read(
-        reader: Any, image: Any, allowlist: str
+        reader: Any, image: Any, allowlist: str, join_line: bool = False
     ) -> list[tuple[str, float]]:
         if reader is None:
             return []
@@ -298,12 +298,23 @@ class CardOCREngine:
             # still get a chance to identify the card.
             return []
         attempts: list[tuple[str, float]] = []
+        positioned: list[tuple[float, str, float]] = []
         for item in results:
             if len(item) >= 3:
                 text = str(item[1]).strip()
                 score = float(item[2]) * 100.0
                 if text:
                     attempts.append((text, score))
+                    if join_line and item[0]:
+                        left = min(float(point[0]) for point in item[0])
+                        positioned.append((left, text, score))
+        if join_line and len(positioned) >= 2:
+            positioned.sort(key=lambda item: item[0])
+            combined = "".join(item[1] for item in positioned)
+            if combined and combined not in {text for text, _score in attempts}:
+                attempts.append(
+                    (combined, sum(item[2] for item in positioned) / len(positioned))
+                )
         return attempts
 
     @staticmethod
@@ -530,6 +541,42 @@ class CardOCREngine:
         if hint == name:
             return 1.0
         return SequenceMatcher(None, hint, name).ratio()
+
+    @staticmethod
+    def collector_leading_noise_suffix(
+        collector_hint: str, printed_total: int | None
+    ) -> str:
+        """Offer a one-digit-trimmed hypothesis without changing valid secret rares."""
+        digits = re.sub(r"\D", "", collector_hint.split("/", 1)[0])
+        if printed_total is None or len(digits) != 3:
+            return ""
+        if int(digits) <= printed_total:
+            return ""
+        suffix = digits[1:].lstrip("0") or "0"
+        return suffix if int(suffix) <= printed_total else ""
+
+    @classmethod
+    def decisive_fraction_title_match(
+        cls,
+        cards: list[dict[str, Any]],
+        set_hint: str,
+        name_hint: str,
+    ) -> bool:
+        """Require strong title separation before trusting a catalog fraction."""
+        if not cards or not name_hint:
+            return False
+        best_name = cls.name_similarity(name_hint, str(cards[0].get("name", "")))
+        second_name = (
+            cls.name_similarity(name_hint, str(cards[1].get("name", "")))
+            if len(cards) > 1
+            else 0.0
+        )
+        best_set = cls.set_code_similarity(set_hint, str(cards[0].get("set_code", "")))
+        return (
+            best_name >= 0.72
+            and best_name - second_name >= 0.15
+            and (best_set >= 0.60 or best_name >= 0.90)
+        )
 
     @classmethod
     def catalog_candidate_score(
@@ -961,7 +1008,9 @@ class CardOCREngine:
             )
             add_attempts(
                 "EasyOCR number binary",
-                self._easy_read(reader, number_binary, self.NUMBER_ALLOWLIST),
+                self._easy_read(
+                    reader, number_binary, self.NUMBER_ALLOWLIST, join_line=True
+                ),
             )
             regulation_attempts.extend(
                 (text, score, "EasyOCR regulation binary")
@@ -997,6 +1046,7 @@ class CardOCREngine:
                         reader,
                         self._prepare_adaptive(number_region, target_scale),
                         self.NUMBER_ALLOWLIST,
+                        join_line=True,
                     ),
                 )
             backend_lines.append(
