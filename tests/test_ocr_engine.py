@@ -440,6 +440,26 @@ class CardOCREngineTests(unittest.TestCase):
         self.assertEqual("SWPKE", title)
         self.assertEqual(92.0, confidence)
 
+    def test_title_hints_keep_lower_confidence_catalog_name(self) -> None:
+        hints = self.engine._ranked_title_attempts(
+            [
+                ("BASIS", 96.0, "title enhanced"),
+                ("Mega Kangaskhan", 28.0, "title enhanced"),
+                ("Celebi", 25.0, "title binary"),
+            ]
+        )
+        self.assertIn("Mega Kangaskhan", [text for text, _score in hints])
+        self.assertIn("Celebi", [text for text, _score in hints])
+
+    def test_title_hints_join_separate_ex_suffix(self) -> None:
+        hints = self.engine._ranked_title_attempts(
+            [
+                ("Genesect", 82.0, "title binary"),
+                ("ex", 55.0, "title binary"),
+            ]
+        )
+        self.assertIn("Genesect ex", [text for text, _score in hints])
+
     def test_title_region_avoids_right_side_hp_area(self) -> None:
         self.assertEqual((70, 25, 800, 203), self.engine._title_region_bounds(1000, 1400))
 

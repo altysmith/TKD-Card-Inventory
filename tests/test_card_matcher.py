@@ -71,6 +71,9 @@ class CardMatcherResolutionTests(unittest.TestCase):
             card("Hydreigon ex", "WHT", "67", 86, "I"),
             card("Sliggoo", "CRI", "67", 86, "J"),
             card("Academy at Night", "SFA", "54", 64, "H"),
+            card("Mega Kangaskhan ex", "MEG", "104", 132, "I"),
+            card("Celebi", "MEG", "12", 132, "I"),
+            card("Celebi", "VIV", "9", 185, "D"),
         ]
         self.matcher = CardMatcher(FakeCatalog(self.cards))
 
@@ -134,6 +137,50 @@ class CardMatcherResolutionTests(unittest.TestCase):
         self.assertTrue(result.decisive)
         self.assertEqual("SFA", result.set_value)
         self.assertEqual("54/64", result.number_value)
+
+    def test_alternate_title_resolves_ex_card_with_exact_fraction(self) -> None:
+        result = self.matcher.resolve(
+            name="Megal",
+            set_query="JMG",
+            number_text="104/132",
+            fuzzy_name_hint="Megal",
+            title_hints=(("Megal", 95.0), ("MegaKangashmex", 38.0)),
+            prefer_name=True,
+        )
+        self.assertTrue(result.decisive)
+        self.assertEqual("Mega Kangaskhan ex", result.name_value)
+
+    def test_base_and_ex_title_variants_require_review_without_identifier(self) -> None:
+        cards = [
+            card("Genesect", "PLB", "10", 101),
+            card("Genesect ex", "BLK", "67", 86, "I"),
+        ]
+        matcher = CardMatcher(FakeCatalog(cards))
+        result = matcher.resolve(
+            name="Genesect",
+            fuzzy_name_hint="Genesect",
+            title_hints=(("Genesect", 90.0), ("Genesect ex", 55.0)),
+            prefer_name=True,
+        )
+        self.assertFalse(result.decisive)
+        self.assertCountEqual(
+            ["Genesect", "Genesect ex"],
+            [item["name"] for item in result.matches],
+        )
+
+    def test_lower_confidence_exact_title_replaces_selected_junk_for_review(self) -> None:
+        result = self.matcher.resolve(
+            name="DASIS",
+            set_query="MEG",
+            fuzzy_name_hint="DASIS",
+            title_hints=(("DASIS", 79.0), ("Celebi", 64.0)),
+            prefer_name=True,
+            trust_set_hint=False,
+        )
+        self.assertFalse(result.decisive)
+        self.assertEqual("Celebi", result.name_value)
+        self.assertTrue(result.matches)
+        self.assertTrue(all(item["name"] == "Celebi" for item in result.matches))
 
 
 if __name__ == "__main__":

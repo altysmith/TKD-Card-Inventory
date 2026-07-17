@@ -43,6 +43,7 @@ class CardMatcher:
     NUMBER_FRAGMENT_MIN = 0.50
     NUMBER_FRAGMENT_MARGIN_MIN = 0.20
     NUMBER_FRAGMENT_MAX_CANDIDATES = 5
+    TITLE_HINT_CONFIDENCE_MIN = 8.0
 
     SET_SCORE_WEIGHT = 25.0
     NAME_SCORE_WEIGHT = 60.0
@@ -76,6 +77,35 @@ class CardMatcher:
             return cls.EXACT_SIMILARITY
         return SequenceMatcher(None, hint, name).ratio()
 
+    @classmethod
+    def title_texts(
+        cls,
+        primary: str,
+        title_hints: tuple[tuple[str, float], ...] = (),
+    ) -> tuple[str, ...]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for text, confidence in ((primary, 100.0), *title_hints):
+            normalized = cls._normalize_name(text)
+            if (
+                not normalized
+                or normalized in seen
+                or (text != primary and confidence < cls.TITLE_HINT_CONFIDENCE_MIN)
+            ):
+                continue
+            seen.add(normalized)
+            values.append(text)
+        return tuple(values)
+
+    @classmethod
+    def best_name_similarity(
+        cls, name_hints: tuple[str, ...], card_name: str
+    ) -> float:
+        return max(
+            (cls.name_similarity(hint, card_name) for hint in name_hints),
+            default=0.0,
+        )
+
     @staticmethod
     def collector_leading_noise_suffix(
         collector_hint: str, printed_total: int | None
@@ -94,6 +124,7 @@ class CardMatcher:
         card: dict[str, Any],
         set_hint: str = "",
         name_hint: str = "",
+        name_hints: tuple[str, ...] = (),
         collector_hint: str = "",
         printed_total: int | None = None,
     ) -> float:
@@ -102,9 +133,10 @@ class CardMatcher:
             score += cls.set_code_similarity(
                 set_hint, str(card.get("set_code", ""))
             ) * cls.SET_SCORE_WEIGHT
-        if name_hint:
-            score += cls.name_similarity(
-                name_hint, str(card.get("name", ""))
+        combined_name_hints = cls.title_texts(name_hint) + tuple(name_hints)
+        if combined_name_hints:
+            score += cls.best_name_similarity(
+                combined_name_hints, str(card.get("name", ""))
             ) * cls.NAME_SCORE_WEIGHT
         if collector_hint:
             expected = re.sub(r"\D", "", collector_hint.split("/", 1)[0])
@@ -132,6 +164,7 @@ class CardMatcher:
         cards: list[dict[str, Any]],
         set_hint: str,
         name_hint: str = "",
+        name_hints: tuple[str, ...] = (),
         collector_hint: str = "",
         printed_total: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -142,6 +175,7 @@ class CardMatcher:
                     card,
                     set_hint=set_hint,
                     name_hint=name_hint,
+                    name_hints=name_hints,
                     collector_hint=collector_hint,
                     printed_total=printed_total,
                 ),
@@ -156,12 +190,16 @@ class CardMatcher:
         cards: list[dict[str, Any]],
         set_hint: str,
         name_hint: str,
+        name_hints: tuple[str, ...] = (),
     ) -> bool:
-        if not cards or not name_hint:
+        all_name_hints = cls.title_texts(name_hint) + tuple(name_hints)
+        if not cards or not all_name_hints:
             return False
-        best_name = cls.name_similarity(name_hint, str(cards[0].get("name", "")))
+        best_name = cls.best_name_similarity(
+            all_name_hints, str(cards[0].get("name", ""))
+        )
         second_name = (
-            cls.name_similarity(name_hint, str(cards[1].get("name", "")))
+            cls.best_name_similarity(all_name_hints, str(cards[1].get("name", "")))
             if len(cards) > 1
             else 0.0
         )
@@ -177,14 +215,21 @@ class CardMatcher:
 
     @classmethod
     def decisive_title_match(
-        cls, cards: list[dict[str, Any]], set_hint: str, name_hint: str
+        cls,
+        cards: list[dict[str, Any]],
+        set_hint: str,
+        name_hint: str,
+        name_hints: tuple[str, ...] = (),
     ) -> bool:
-        if not cards or not set_hint or not name_hint:
+        all_name_hints = cls.title_texts(name_hint) + tuple(name_hints)
+        if not cards or not set_hint or not all_name_hints:
             return False
         best_set = cls.set_code_similarity(set_hint, str(cards[0].get("set_code", "")))
-        best_name = cls.name_similarity(name_hint, str(cards[0].get("name", "")))
+        best_name = cls.best_name_similarity(
+            all_name_hints, str(cards[0].get("name", ""))
+        )
         second_name = (
-            cls.name_similarity(name_hint, str(cards[1].get("name", "")))
+            cls.best_name_similarity(all_name_hints, str(cards[1].get("name", "")))
             if len(cards) > 1
             else 0.0
         )
@@ -201,10 +246,14 @@ class CardMatcher:
         set_hint: str,
         name_hint: str,
         collector_hint: str = "",
+        name_hints: tuple[str, ...] = (),
     ) -> bool:
-        if cls.decisive_title_match(cards, set_hint, name_hint):
+        all_name_hints = cls.title_texts(name_hint) + tuple(name_hints)
+        if cls.decisive_title_match(
+            cards, set_hint, name_hint, name_hints=name_hints
+        ):
             return True
-        if not cards or not set_hint or not name_hint or not collector_hint:
+        if not cards or not set_hint or not all_name_hints or not collector_hint:
             return False
         expected = re.sub(r"\D", "", collector_hint.split("/", 1)[0])
         best_actual = re.sub(
@@ -224,7 +273,9 @@ class CardMatcher:
         return (
             cls.set_code_similarity(set_hint, str(cards[0].get("set_code", "")))
             >= cls.TITLE_SET_MIN
-            and cls.name_similarity(name_hint, str(cards[0].get("name", "")))
+            and cls.best_name_similarity(
+                all_name_hints, str(cards[0].get("name", ""))
+            )
             >= cls.CATALOG_TITLE_NAME_MIN
             and bool(expected)
             and best_actual == expected
@@ -380,6 +431,7 @@ class CardMatcher:
         number_text: str = "",
         printed_total: int | None = None,
         fuzzy_name_hint: str = "",
+        title_hints: tuple[tuple[str, float], ...] = (),
         prefer_name: bool = False,
         trust_set_hint: bool = True,
         regulation_mark: str = "",
@@ -394,8 +446,9 @@ class CardMatcher:
             if total_text.isdigit():
                 printed_total = int(total_text)
         title_hint = fuzzy_name_hint or name
+        all_title_hints = self.title_texts(title_hint, title_hints)
 
-        if prefer_name and title_hint and number and printed_total is not None:
+        if all_title_hints and number and printed_total is not None:
             candidates = self.catalog.search_cards(
                 number=number,
                 printed_total=printed_total,
@@ -405,10 +458,16 @@ class CardMatcher:
                 candidates,
                 set_query,
                 name_hint=title_hint,
+                name_hints=all_title_hints,
                 collector_hint=number,
                 printed_total=printed_total,
             )
-            if self.decisive_fraction_title_match(candidates, set_query, title_hint):
+            if self.decisive_fraction_title_match(
+                candidates,
+                set_query,
+                title_hint,
+                name_hints=all_title_hints,
+            ):
                 card = candidates[0]
                 return self._resolved(
                     card,
@@ -417,19 +476,56 @@ class CardMatcher:
                     "fraction_title",
                 )
 
-        if prefer_name and title_hint:
-            title_candidates = self.catalog.search_cards(
-                name=title_hint, limit=self.TITLE_SEARCH_LIMIT
+        catalog_title_hint = ""
+        title_candidates: list[dict[str, Any]] = []
+        exact_title_groups: list[tuple[str, list[dict[str, Any]]]] = []
+        if all_title_hints and (prefer_name or number or set_query):
+            for candidate_hint in all_title_hints:
+                candidate_cards = self.catalog.search_cards(
+                    name=candidate_hint, limit=self.TITLE_SEARCH_LIMIT
+                )
+                exact_cards = [
+                    card
+                    for card in candidate_cards
+                    if self.name_similarity(
+                        candidate_hint, str(card.get("name", ""))
+                    )
+                    == self.EXACT_SIMILARITY
+                ]
+                if exact_cards:
+                    exact_title_groups.append((candidate_hint, exact_cards))
+
+        exact_names = {
+            self._normalize_name(str(card.get("name", "")))
+            for _hint, cards in exact_title_groups
+            for card in cards
+        }
+        if len(exact_names) > 1:
+            combined: dict[str, dict[str, Any]] = {}
+            for _hint, cards in exact_title_groups:
+                for card in cards:
+                    combined[str(card.get("id", id(card)))] = card
+            matches = self.rank_number_fragment_candidates(
+                list(combined.values()), number_hints
             )
+            return MatchResolution(
+                matches=matches,
+                message="Multiple title variants found; confirmation required",
+                strategy="title_variant_review",
+            )
+        if exact_title_groups:
+            catalog_title_hint, title_candidates = exact_title_groups[0]
+
+        if catalog_title_hint:
             exact_title_count = sum(
-                self.name_similarity(title_hint, str(card.get("name", "")))
+                self.name_similarity(catalog_title_hint, str(card.get("name", "")))
                 == self.EXACT_SIMILARITY
                 for card in title_candidates
             )
             title_candidates, used_set_hint, used_exact_identifier = (
                 self.narrow_exact_name_candidates(
                     title_candidates,
-                    title_hint,
+                    catalog_title_hint,
                     set_hint=set_query,
                     collector_hint=number,
                     printed_total=printed_total,
@@ -463,7 +559,7 @@ class CardMatcher:
                     result = self._resolved(
                         card,
                         prefix
-                        + f"Catalog resolved {card.get('name', title_hint)} "
+                        + f"Catalog resolved {card.get('name', catalog_title_hint)} "
                         + f"{card.get('set_code', '')} {card.get('number', '')}",
                         "exact_title",
                     )
@@ -475,6 +571,7 @@ class CardMatcher:
                 )
                 return MatchResolution(
                     matches=matches,
+                    name_value=catalog_title_hint,
                     set_value="" if ignored_set_hint else None,
                     message=prefix + message,
                     strategy="exact_title_review",
@@ -515,7 +612,7 @@ class CardMatcher:
             used_relaxed_identifier_match = bool(matches)
 
         corrected_number = self.collector_leading_noise_suffix(number, printed_total)
-        if not matches and corrected_number and title_hint:
+        if not matches and corrected_number and all_title_hints:
             candidates = self.catalog.search_cards(
                 number=corrected_number,
                 printed_total=printed_total,
@@ -525,10 +622,16 @@ class CardMatcher:
                 candidates,
                 set_query,
                 name_hint=title_hint,
+                name_hints=all_title_hints,
                 collector_hint=corrected_number,
                 printed_total=printed_total,
             )
-            if self.decisive_fraction_title_match(candidates, set_query, title_hint):
+            if self.decisive_fraction_title_match(
+                candidates,
+                set_query,
+                title_hint,
+                name_hints=all_title_hints,
+            ):
                 card = candidates[0]
                 return self._resolved(
                     card,
@@ -539,7 +642,7 @@ class CardMatcher:
             if candidates:
                 matches = candidates[: self.REVIEW_LIMIT]
 
-        if not matches and title_hint and set_query:
+        if not matches and all_title_hints and set_query:
             candidates = self.catalog.search_cards(
                 set_query=set_query, limit=self.TITLE_SEARCH_LIMIT
             )
@@ -547,11 +650,16 @@ class CardMatcher:
                 candidates,
                 set_query,
                 name_hint=title_hint,
+                name_hints=all_title_hints,
                 collector_hint=number,
                 printed_total=printed_total,
             )
             if self.decisive_catalog_match(
-                candidates, set_query, title_hint, collector_hint=number
+                candidates,
+                set_query,
+                title_hint,
+                collector_hint=number,
+                name_hints=all_title_hints,
             ):
                 card = candidates[0]
                 return self._resolved(
@@ -563,7 +671,9 @@ class CardMatcher:
             matches = [
                 card
                 for card in candidates[: self.REVIEW_LIMIT]
-                if self.name_similarity(title_hint, str(card.get("name", "")))
+                if self.best_name_similarity(
+                    all_title_hints, str(card.get("name", ""))
+                )
                 >= self.REVIEW_TITLE_NAME_MIN
             ]
 

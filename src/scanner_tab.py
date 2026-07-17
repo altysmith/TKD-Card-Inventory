@@ -539,6 +539,7 @@ class ScannerTab(QWidget):
                     if result.card_name_confidence >= self.TITLE_CONFIDENCE_MIN
                     else ""
                 ),
+                title_hints=result.title_hints,
                 prefer_name=result.card_name_confidence >= self.TITLE_CONFIDENCE_MIN,
                 trust_set_hint=result.set_code_confidence >= self.SET_CONFIDENCE_MIN,
                 regulation_mark=(
@@ -642,6 +643,7 @@ class ScannerTab(QWidget):
         self,
         printed_total: int | None = None,
         fuzzy_name_hint: str = "",
+        title_hints: tuple[tuple[str, float], ...] = (),
         prefer_name: bool = False,
         trust_set_hint: bool = True,
         regulation_mark: str = "",
@@ -662,6 +664,7 @@ class ScannerTab(QWidget):
             number_text=number_text,
             printed_total=printed_total,
             fuzzy_name_hint=fuzzy_name_hint,
+            title_hints=title_hints,
             prefer_name=prefer_name,
             trust_set_hint=trust_set_hint,
             regulation_mark=regulation_mark,

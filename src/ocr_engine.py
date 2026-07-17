@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover
 class OCRResult:
     card_name: str = ""
     card_name_confidence: float = 0.0
+    title_hints: tuple[tuple[str, float], ...] = ()
     set_code: str = ""
     set_code_confidence: float = 0.0
     regulation_mark: str = ""
@@ -54,6 +55,8 @@ class CardOCREngine:
     NUMBER_ALLOWLIST = "0123456789/"
     TITLE_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-' ."
     REGULATION_ALLOWLIST = "DEFGHI"
+    TITLE_SUFFIXES = {"EX", "GX", "V", "VMAX", "VSTAR", "BREAK"}
+    MAX_TITLE_HINTS = 8
     _easy_reader: Any = None
     _easy_error: str = ""
 
@@ -376,22 +379,54 @@ class CardOCREngine:
         return re.sub(r"[^A-Z0-9]", "", text.upper())
 
     @classmethod
-    def _best_title_attempt(
+    def _ranked_title_attempts(
         cls, attempts: list[tuple[str, float, str]]
-    ) -> tuple[str, float]:
-        ignored = {"BASIC", "STAGE", "TRAINER", "ITEM", "HP"}
-        candidates: list[tuple[float, str, float]] = []
-        for text, confidence, _source in attempts:
+    ) -> tuple[tuple[str, float], ...]:
+        ignored = {
+            "BASIC", "STAGE", "STAGE1", "STAGE2", "TRAINER", "ITEM",
+            "SUPPORTER", "STADIUM", "ENERGY", "HP",
+        }
+        candidates: dict[str, tuple[float, str, float]] = {}
+        previous_by_source: dict[str, tuple[str, float]] = {}
+
+        def add(text: str, confidence: float) -> None:
             clean = re.sub(r"\s+", " ", text).strip(" .-'\t\r\n")
             normalized = cls._normalize_name(clean)
             if len(normalized) < 3 or normalized in ignored or normalized.isdigit():
-                continue
+                return
             rank = float(confidence) + min(15, len(normalized)) * 1.5
-            candidates.append((rank, clean, float(confidence)))
+            current = candidates.get(normalized)
+            if current is None or rank > current[0]:
+                candidates[normalized] = (rank, clean, float(confidence))
+
+        for text, confidence, source in attempts:
+            clean = re.sub(r"\s+", " ", text).strip(" .-'\t\r\n")
+            normalized = cls._normalize_name(clean)
+            if normalized in cls.TITLE_SUFFIXES:
+                previous = previous_by_source.get(source)
+                if previous is not None:
+                    base, base_confidence = previous
+                    add(f"{base} {clean}", min(float(confidence), base_confidence))
+                continue
+            add(clean, float(confidence))
+            if (
+                len(normalized) >= 4
+                and normalized not in ignored
+                and not normalized.isdigit()
+            ):
+                previous_by_source[source] = (clean, float(confidence))
+
         if not candidates:
-            return "", 0.0
-        _rank, text, confidence = max(candidates, key=lambda item: item[0])
-        return text, confidence
+            return ()
+        ranked = sorted(candidates.values(), key=lambda item: item[0], reverse=True)
+        return tuple((text, confidence) for _rank, text, confidence in ranked[: cls.MAX_TITLE_HINTS])
+
+    @classmethod
+    def _best_title_attempt(
+        cls, attempts: list[tuple[str, float, str]]
+    ) -> tuple[str, float]:
+        ranked = cls._ranked_title_attempts(attempts)
+        return ranked[0] if ranked else ("", 0.0)
 
     @classmethod
     def _best_regulation_attempt(
@@ -828,7 +863,8 @@ class CardOCREngine:
             if set_code
             else 0.0
         )
-        card_name, card_name_confidence = self._best_title_attempt(title_attempts)
+        title_hints = self._ranked_title_attempts(title_attempts)
+        card_name, card_name_confidence = title_hints[0] if title_hints else ("", 0.0)
         regulation_mark, regulation_mark_confidence = self._best_regulation_attempt(
             regulation_attempts
         )
@@ -882,6 +918,12 @@ class CardOCREngine:
             "Recognition strategy: title, regulation, set-code, and collector-number OCR, "
             "then catalog resolution",
             *backend_lines,
+            "Retained title hints: "
+            + (
+                "; ".join(f"{text} ({score:.0f}%)" for text, score in title_hints)
+                if title_hints
+                else "<none>"
+            ),
             "OCR attempts:",
         ]
         raw_lines.extend(
@@ -903,6 +945,7 @@ class CardOCREngine:
         return OCRResult(
             card_name=card_name,
             card_name_confidence=card_name_confidence,
+            title_hints=title_hints,
             set_code=set_code,
             set_code_confidence=set_code_confidence,
             regulation_mark=regulation_mark,
